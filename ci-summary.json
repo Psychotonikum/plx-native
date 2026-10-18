@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-18T22:23:36Z",
+ "generated": "2026-10-18T23:46:06Z",
  "metrics": [
   {
    "change30_pct": null,
@@ -65,17 +65,17 @@
    "unit": "s"
   },
   {
-   "change30_pct": -47.3,
+   "change30_pct": -47.8,
    "change7_pct": 40.7,
-   "d30": 891.0,
-   "delta30": -421.0,
+   "d30": 900,
+   "delta30": -430,
    "delta7": 136,
    "group": "ci",
    "id": "pr_wait",
    "kind": "wait",
    "label": "PR CI wait",
-   "n_now": 73,
-   "n_prev": 201,
+   "n_now": 71,
+   "n_prev": 203,
    "now": 470,
    "prev7": 334,
    "shown": true,
@@ -86,18 +86,18 @@
    "unit": "s"
   },
   {
-   "change30_pct": -46.7,
-   "change7_pct": 29.7,
+   "change30_pct": -46.8,
+   "change7_pct": 29.4,
    "d30": 778,
-   "delta30": -363.0,
-   "delta7": 95.0,
+   "delta30": -364,
+   "delta7": 94,
    "group": "ci",
    "id": "push_wait",
    "kind": "wait",
    "label": "Wait after merge",
-   "n_now": 36,
+   "n_now": 37,
    "n_prev": 109,
-   "now": 415.0,
+   "now": 414,
    "prev7": 320,
    "shown": true,
    "state": "worse",
@@ -287,18 +287,18 @@
    "unit": "s"
   },
   {
-   "change30_pct": 106.5,
-   "change7_pct": -3.9,
+   "change30_pct": 107.0,
+   "change7_pct": -3.7,
    "d30": 107,
-   "delta30": 114,
-   "delta7": -9,
+   "delta30": 114.5,
+   "delta7": -8.5,
    "group": "ci",
    "id": "sim|Linux simulator build + launch",
    "kind": "job",
    "label": "Simulator CI: Linux simulator build + launch",
-   "n_now": 33,
+   "n_now": 34,
    "n_prev": 101,
-   "now": 221,
+   "now": 221.5,
    "prev7": 230,
    "shown": true,
    "state": "flat",
@@ -332,15 +332,15 @@
    "change30_pct": 145.9,
    "change7_pct": -43.1,
    "d30": 74,
-   "delta30": 108,
-   "delta7": -138,
+   "delta30": 108.0,
+   "delta7": -138.0,
    "group": "ci",
    "id": "sim|macOS simulator build + launch",
    "kind": "job",
    "label": "Simulator CI: macOS simulator build + launch",
-   "n_now": 33,
+   "n_now": 34,
    "n_prev": 101,
-   "now": 182,
+   "now": 182.0,
    "prev7": 320,
    "shown": true,
    "state": "better",
@@ -372,17 +372,17 @@
   },
   {
    "change30_pct": null,
-   "change7_pct": 8.3,
+   "change7_pct": 6.9,
    "d30": null,
    "delta30": null,
-   "delta7": 12,
+   "delta7": 10.0,
    "group": "ci",
    "id": "sim|macOS tests against bundled FFmpeg and ASS",
    "kind": "job",
    "label": "Simulator CI: macOS tests against bundled FFmpeg and ASS",
-   "n_now": 33,
+   "n_now": 34,
    "n_prev": 97,
-   "now": 156,
+   "now": 154.0,
    "prev7": 144,
    "shown": true,
    "state": "flat",
@@ -502,15 +502,15 @@
    "change30_pct": 6.2,
    "change7_pct": 0.0,
    "d30": 16,
-   "delta30": 1,
-   "delta7": 0,
+   "delta30": 1.0,
+   "delta7": 0.0,
    "group": "ci",
    "id": "sim|Windows launcher syntax",
    "kind": "job",
    "label": "Simulator CI: Windows launcher syntax",
-   "n_now": 33,
+   "n_now": 34,
    "n_prev": 101,
-   "now": 17,
+   "now": 17.0,
    "prev7": 17,
    "shown": false,
    "state": "flat",
@@ -567,11 +567,6 @@
    "change_pct": 244.5,
    "commits": [
     {
-     "pr": 685,
-     "sha": "7fc1ea9ac",
-     "title": "Track memory write path: a subtitle or audio pick on an episode is remembered for its show"
-    },
-    {
      "pr": 667,
      "sha": "845527541",
      "title": "Image cache: reach webOS 3.4's one writable directory, sized to its free space"
@@ -615,6 +610,11 @@
      "pr": null,
      "sha": "90c2d038a",
      "title": "git: stop tracking .agents/skills \u2014 keep agent skills out of the public repo"
+    },
+    {
+     "pr": null,
+     "sha": "7adba8750",
+     "title": "api: GET /llm \u2014 the operator guide any LLM can curl"
     }
    ],
    "from": 55.7,
@@ -628,11 +628,6 @@
    "change_pct": 98.1,
    "commits": [
     {
-     "pr": 685,
-     "sha": "7fc1ea9ac",
-     "title": "Track memory write path: a subtitle or audio pick on an episode is remembered for its show"
-    },
-    {
      "pr": 667,
      "sha": "845527541",
      "title": "Image cache: reach webOS 3.4's one writable directory, sized to its free space"
@@ -676,6 +671,11 @@
      "pr": null,
      "sha": "90c2d038a",
      "title": "git: stop tracking .agents/skills \u2014 keep agent skills out of the public repo"
+    },
+    {
+     "pr": null,
+     "sha": "7adba8750",
+     "title": "api: GET /llm \u2014 the operator guide any LLM can curl"
     }
    ],
    "from": 208.5,
@@ -689,11 +689,6 @@
    "change_pct": 44.7,
    "commits": [
     {
-     "pr": 685,
-     "sha": "7fc1ea9ac",
-     "title": "Track memory write path: a subtitle or audio pick on an episode is remembered for its show"
-    },
-    {
      "pr": 667,
      "sha": "845527541",
      "title": "Image cache: reach webOS 3.4's one writable directory, sized to its free space"
@@ -737,6 +732,11 @@
      "pr": null,
      "sha": "90c2d038a",
      "title": "git: stop tracking .agents/skills \u2014 keep agent skills out of the public repo"
+    },
+    {
+     "pr": null,
+     "sha": "7adba8750",
+     "title": "api: GET /llm \u2014 the operator guide any LLM can curl"
     }
    ],
    "from": 264.0,
@@ -750,11 +750,6 @@
    "change_pct": 40.7,
    "commits": [
     {
-     "pr": 685,
-     "sha": "7fc1ea9ac",
-     "title": "Track memory write path: a subtitle or audio pick on an episode is remembered for its show"
-    },
-    {
      "pr": 667,
      "sha": "845527541",
      "title": "Image cache: reach webOS 3.4's one writable directory, sized to its free space"
@@ -798,6 +793,11 @@
      "pr": null,
      "sha": "90c2d038a",
      "title": "git: stop tracking .agents/skills \u2014 keep agent skills out of the public repo"
+    },
+    {
+     "pr": null,
+     "sha": "7adba8750",
+     "title": "api: GET /llm \u2014 the operator guide any LLM can curl"
     }
    ],
    "from": 334,
@@ -808,74 +808,29 @@
    "to": 470
   },
   {
-   "change_pct": 29.7,
+   "change_pct": 29.4,
    "commits": [
-    {
-     "pr": 685,
-     "sha": "7fc1ea9ac",
-     "title": "Track memory write path: a subtitle or audio pick on an episode is remembered for its show"
-    },
-    {
-     "pr": 667,
-     "sha": "845527541",
-     "title": "Image cache: reach webOS 3.4's one writable directory, sized to its free space"
-    },
-    {
-     "pr": 688,
-     "sha": "db6e2c2fa",
-     "title": "Tests: a resolve's captured event log is private to it, so a second run's lines cannot join it"
-    },
-    {
-     "pr": 641,
-     "sha": "1331b7a16",
-     "title": "Accept NUL-terminated embedded ASS headers and packets from FFmpeg"
-    },
-    {
-     "pr": 655,
-     "sha": "63fb1fe57",
-     "title": "webOS 3.x: hide the Magic Remote pointer on D-pad presses and after 5 s idle"
-    },
-    {
-     "pr": 691,
-     "sha": "d507c4f9e",
-     "title": "Track memory: a remembered external subtitle selects the next episode's same-language sidecar (C5)"
-    },
-    {
-     "pr": 687,
-     "sha": "b1f35c05b",
-     "title": "net, media: the player sends the User-Agent boot installs"
-    },
-    {
-     "pr": 690,
-     "sha": "2e7af25b6",
-     "title": "Track memory: an applied remembered choice is written back to Plex on the first decoded frame (WB)"
-    },
-    {
-     "pr": 692,
-     "sha": "d5a911194",
-     "title": "Direct Play of >4 GiB moov-at-end MP4s on webOS 3 (416 at EOF, 32-bit body length, DV declaration)"
-    },
     {
      "pr": null,
      "sha": "90c2d038a",
      "title": "git: stop tracking .agents/skills \u2014 keep agent skills out of the public repo"
+    },
+    {
+     "pr": null,
+     "sha": "7adba8750",
+     "title": "api: GET /llm \u2014 the operator guide any LLM can curl"
     }
    ],
    "from": 320,
    "id": "push_wait",
    "label": "Wait after merge",
-   "since": "2026-10-14",
+   "since": "2026-10-18",
    "threshold_pct": 15.0,
-   "to": 415.0
+   "to": 414
   },
   {
    "change_pct": 26.5,
    "commits": [
-    {
-     "pr": 685,
-     "sha": "7fc1ea9ac",
-     "title": "Track memory write path: a subtitle or audio pick on an episode is remembered for its show"
-    },
     {
      "pr": 667,
      "sha": "845527541",
@@ -920,6 +875,11 @@
      "pr": null,
      "sha": "90c2d038a",
      "title": "git: stop tracking .agents/skills \u2014 keep agent skills out of the public repo"
+    },
+    {
+     "pr": null,
+     "sha": "7adba8750",
+     "title": "api: GET /llm \u2014 the operator guide any LLM can curl"
     }
    ],
    "from": 37.8,
@@ -933,11 +893,6 @@
    "change_pct": 26.1,
    "commits": [
     {
-     "pr": 685,
-     "sha": "7fc1ea9ac",
-     "title": "Track memory write path: a subtitle or audio pick on an episode is remembered for its show"
-    },
-    {
      "pr": 667,
      "sha": "845527541",
      "title": "Image cache: reach webOS 3.4's one writable directory, sized to its free space"
@@ -981,6 +936,11 @@
      "pr": null,
      "sha": "90c2d038a",
      "title": "git: stop tracking .agents/skills \u2014 keep agent skills out of the public repo"
+    },
+    {
+     "pr": null,
+     "sha": "7adba8750",
+     "title": "api: GET /llm \u2014 the operator guide any LLM can curl"
     }
    ],
    "from": 21.2,
@@ -1021,7 +981,7 @@
    "group": "ci",
    "id": "sim|Linux simulator build + launch",
    "label": "Simulator CI: Linux simulator build + launch",
-   "now": 221
+   "now": 221.5
   }
  ],
  "slowest_local": [
