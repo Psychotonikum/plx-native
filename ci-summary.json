@@ -1,5 +1,5 @@
 {
- "generated": "2026-10-18T23:46:06Z",
+ "generated": "2026-10-18T23:47:22Z",
  "metrics": [
   {
    "change30_pct": null,
@@ -86,18 +86,18 @@
    "unit": "s"
   },
   {
-   "change30_pct": -46.8,
-   "change7_pct": 29.4,
+   "change30_pct": -46.7,
+   "change7_pct": 29.7,
    "d30": 778,
-   "delta30": -364,
-   "delta7": 94,
+   "delta30": -363.0,
+   "delta7": 95.0,
    "group": "ci",
    "id": "push_wait",
    "kind": "wait",
    "label": "Wait after merge",
-   "n_now": 37,
+   "n_now": 36,
    "n_prev": 109,
-   "now": 414,
+   "now": 415.0,
    "prev7": 320,
    "shown": true,
    "state": "worse",
@@ -808,8 +808,48 @@
    "to": 470
   },
   {
-   "change_pct": 29.4,
+   "change_pct": 29.7,
    "commits": [
+    {
+     "pr": 667,
+     "sha": "845527541",
+     "title": "Image cache: reach webOS 3.4's one writable directory, sized to its free space"
+    },
+    {
+     "pr": 688,
+     "sha": "db6e2c2fa",
+     "title": "Tests: a resolve's captured event log is private to it, so a second run's lines cannot join it"
+    },
+    {
+     "pr": 641,
+     "sha": "1331b7a16",
+     "title": "Accept NUL-terminated embedded ASS headers and packets from FFmpeg"
+    },
+    {
+     "pr": 655,
+     "sha": "63fb1fe57",
+     "title": "webOS 3.x: hide the Magic Remote pointer on D-pad presses and after 5 s idle"
+    },
+    {
+     "pr": 691,
+     "sha": "d507c4f9e",
+     "title": "Track memory: a remembered external subtitle selects the next episode's same-language sidecar (C5)"
+    },
+    {
+     "pr": 687,
+     "sha": "b1f35c05b",
+     "title": "net, media: the player sends the User-Agent boot installs"
+    },
+    {
+     "pr": 690,
+     "sha": "2e7af25b6",
+     "title": "Track memory: an applied remembered choice is written back to Plex on the first decoded frame (WB)"
+    },
+    {
+     "pr": 692,
+     "sha": "d5a911194",
+     "title": "Direct Play of >4 GiB moov-at-end MP4s on webOS 3 (416 at EOF, 32-bit body length, DV declaration)"
+    },
     {
      "pr": null,
      "sha": "90c2d038a",
@@ -824,9 +864,9 @@
    "from": 320,
    "id": "push_wait",
    "label": "Wait after merge",
-   "since": "2026-10-18",
+   "since": "2026-10-14",
    "threshold_pct": 15.0,
-   "to": 414
+   "to": 415.0
   },
   {
    "change_pct": 26.5,
