@@ -289,9 +289,7 @@ pub(crate) unsafe fn handle(app: &mut crate::app::App, fr: &mut crate::app::run:
         None => (spec, ""),
     };
     match kind {
-        // `api:play` and `api:profile` are gone: both needed the HTTP write path (a PMS
-        // resolve parked on the API thread, and a `/auth` to read the outcome). With the
-        // HTTP surface read-only, neither can be armed from a FIFO token.
+        "play" => handle_play(app, fr, arg),
         "pause" => handle_transport(app, fr, false),
         "resume" => handle_transport(app, fr, true),
         "stop" => handle_stop(app, fr),
@@ -307,6 +305,60 @@ pub(crate) unsafe fn handle(app: &mut crate::app::App, fr: &mut crate::app::run:
         "quality" => handle_quality(app, fr, arg),
         _ => false,
     }
+}
+
+/// The headless play ritual, performed on the frame thread: look up the `rk` in the
+/// home hub's `PmsMovie` cache, then the same three calls the dev live-play scenario
+/// makes in the same order — request the item (which owns the resolve), ask for its
+/// detail (the HUD's context), then seat the engine. No HTTP staging: the FIFO token
+/// carries the `rk` directly and the PMS data is already resident in the app's
+/// `bridge.hubs` snapshot (populated by the home screen's own catalog load), so the
+/// frame thread can resolve without the API thread ever fetching it.
+unsafe fn handle_play(
+    app: &mut crate::app::App,
+    _fr: &mut crate::app::run::Frame,
+    rk: &str,
+) -> bool {
+    let snap = app.bridge.hubs_snapshot();
+    let view = snap.view();
+    let mut pmm: Option<plx_data::pms::PmsMovie> = None;
+    for i in 0..view.hub_count() {
+        let Some(hub) = view.hub(i) else { continue };
+        if let Some(m) = hub.items.iter().find(|m| m.rk == rk) {
+            pmm = Some((**m).clone());
+            break;
+        }
+    }
+    let Some(pmm) = pmm else {
+        log(&format!("api: play rk {rk}: no item in hubs catalog (stale or unknown rk)"));
+        return false;
+    };
+    let ctx = format!("api play rk {rk}");
+    let requested = plx_media::route::request_play_movie(
+        &mut app.player.session,
+        app.bridge.metadata_mut(),
+        &pmm,
+        &ctx,
+    );
+    if requested {
+        app.bridge.metadata_mut().run(
+            plx_data::stores::metadata::MetadataCmd::RequestDetail {
+                sid: pmm.sid,
+                rk: pmm.rk.clone(),
+            },
+        );
+        crate::app::playback::start_playback(
+            &mut app.player.session,
+            &mut app.adapters.player,
+            0,
+            crate::app::playback::Origin::Here,
+            plx_screens::player::input::HUD_HEADLESS_MS,
+            None,
+            &mut app.pages,
+            &mut app.bridge,
+        );
+    }
+    requested
 }
 
 /// `api:pause` / `api:resume` — the transport key's effect, performed directly on the frame
