@@ -1,5 +1,10 @@
-//! The command API: an UNCONDITIONAL local HTTP surface for an agent (an LLM over SSH, a
-//! test harness, an operator's script) to drive and read the app.
+//! The command API: a READ-ONLY local HTTP surface for an agent (an LLM over SSH, a test
+//! harness, an operator's script) to read the app's state.
+//!
+//! Commands travel the FIFO (`/var/palm/jail/…/plxnative-remote`) — the single input path
+//! the frame loop drains once per frame inside `run::ingest`. This HTTP surface no longer
+//! stages any `api:` token: every write route is gone. What remains are the three reads
+//! plus the binary screenshot answer, which need no token queue at all.
 //!
 //! Everything else in this crate's input story is gated — the remote FIFO is a dev/test
 //! channel, the lab command long-poll is a `lab-diagnostics` feature, `capture` needs a
@@ -9,50 +14,21 @@
 //! stable build the module compiles in but `init` never starts the listener, so nothing
 //! binds. While it runs it binds `INADDR_ANY` with no credential, the same exposure
 //! `capture` accepts when armed: the threat is the LAN, and the surface only exposes
-//! playback state plus the commands a remote control could send.
+//! playback state plus a screenshot — nothing a remote control could not already see.
 //!
 //! Architecture, mirroring `capture` (one listener, no threads per connection beyond what
 //! `task::spawn` allows, state in statics):
 //!
 //! - an API thread runs a tiny HTTP/1.1 server on `capture`'s port + 10
-//!   (`default_port` below). It parses one request per connection and answers JSON.
-//! - WRITE endpoints never touch the frame. They stage work:
-//!   - a `/play` body's `rk` is fetched from PMS ON THE API THREAD (`servers::client().
-//!     metadata(rk)` → `pms::parse_item`), parked in `PENDING_PLAYS`, and the token
-//!     `api:play:<rk>` is posted to `PENDING`;
-//!   - every other verb posts an `api:` token (`api:pause`, `api:resume`, `api:stop`,
-//!     `api:seek:<ms>`, `api:audio:<sid>`, `api:sub:<sid>`).
-//! - the frame loop drains `PENDING` once per frame inside `run::ingest` (the same single
-//!   input path as the FIFO and the lab channel) and hands each token to
-//!   `run::ingress_token`, where the `api:` prefix is peeled and [`handle`] performs it
-//!   with full `&mut App`. Tokens without the prefix pass straight through the existing
-//!   dispatcher — the API can speak the whole FIFO vocabulary.
-//! - READ endpoints answer from `SNAPSHOT`, a string [`report`](run::report) republishes
-//!   every frame from the live `PlaybackSession` + metadata store.
+//!   (`default_port` below). It parses one request per connection and answers JSON (or a
+//!   PNG for `/shot`).
+//! - the frame loop republishes the state snapshot every frame via
+//!   [`report`](run::report) → `publish` into the `SNAPSHOT` static; `GET /state`
+//!   answers from it. No tokens flow into the frame loop from this surface.
 //!
-//! Wire (all JSON):
+//! Wire (all JSON except `/shot`):
 //! - `GET /health`  → `{app, flavour, port, up_ms}`
 //! - `GET /state`   → the last frame's snapshot, or `{"error":"no frame yet"}`
-//! - `POST /play`   body `{"rk":"1234"}` → 202 `{"queued":"api:play:1234"}`; the rk is
-//!   resolved from PMS on the API thread, so a 404 here means PMS does not hold it (or the
-//!   session has no token yet — retry).
-//! - `POST /command` body `{"tok":"pause"}` → 202; any FIFO token (keys, `txt:`, `pat:`, …).
-//! - `POST /pause` / `/resume` / `/stop` → the frame-thread verbs `api:pause` /
-//!   `api:resume` / `api:stop` (the transport key's effect and the exit ritual, performed
-//!   directly — see the verb list below).
-//! - `POST /seek`   body `{"pos_ms":12345}` → `api:seek:12345`.
-//! - `POST /audio`  body `{"sid":2}` → `api:audio:2` (a PMS `Stream.id` from `/state`).
-//! - `POST /sub`    body `{"sid":3}` → `api:sub:3`.
-//! - `POST /quality` body `{"q":"720p_4_mbps"}` → `api:quality:720p_4_mbps` — a rung of the
-//!   playback-quality ladder (the persisted quality spellings, see the verb list). Applied
-//!   LIVE to the stream on screen: the routing question is re-asked and the stream reloads
-//!   only if the answer changed.
-//! - `POST /profile` body `{"index":0}` (optional `"pin":"1234"`) → `api:profile:0:-` — commit
-//!   a pick of the sign-in flow's "who's watching" roster (the same command the roster's rows
-//!   land in). The debug build also answers the roster itself, once per launch, with the first
-//!   user (this household's admin) — see `publish`.
-//! - `GET /auth`    → the sign-in phase, the offered roster and the flow's error line (the
-//!   same object `/state` embeds under `auth`).
 //! - `GET|POST /shot` — the one binary answer in this API (a PNG, so it bypasses the
 //!   JSON-only `reply`): a screenshot of the app's own UI plane — what the app draws (the
 //!   home rows, the detail page, the player HUD) — read back from the GL surface by the
@@ -64,10 +40,8 @@
 //!
 //! The `api:` verbs, performed on the frame thread by [`handle`] (all of them, by
 //! construction, go through the media layer's own commit functions — the same ones the
-//! track menu's picks land in — so nothing here re-implements a playback decision):
-//! - `api:play:<rk>`  — the headless play ritual: `route::request_play_movie` (+ the
-//!   detail request) then `playback::start_playback`, exactly what the dev live-play
-//!   scenario does.
+//! track menu's picks land in — so nothing here re-implements a playback decision). The
+//! FIFO is the only door now; the HTTP surface stages none of these.
 //! - `api:seek:<ms>`  — `player::request_seek(ms * 1_000_000)`.
 //! - `api:audio:<sid>` — the `playing()` item's audio `Stream` whose `id == sid`, through
 //!   `route::commit_audio_selection` with the panel's `audio_ordinal` mapping.
@@ -79,9 +53,6 @@
 //!   the persist-then-fresh-retry path instead, the failure screen's Retry at the new rung.
 //!   The rung is a persisted-quality spelling: `auto`, `original`, `1080p_20_mbps`,
 //!   `1080p_8_mbps`, `720p_4_mbps`, `720p_2_mbps`, `480p_720_kbps`.
-//! - `api:profile:<index>[:<pin>|-]` — `SelectProfile` on the session machine: the same
-//!   commit the "who's watching" roster's rows land in. The outcome (Switching → Ready, or the
-//!   flow's error line) is readable in `GET /auth`.
 //! - `api:pause` / `api:resume` — the transport key's effect performed directly on the frame
 //!   thread: `lifecycle::set_transport_paused` under the PAUSE/PLAY key's `transport_target`,
 //!   plus the HUD linger a key press would extend — the same commit the player page's own
@@ -92,10 +63,7 @@
 //!   `playback::exit_player` (supersede the play, close the overlays, stop the buffer feed,
 //!   return to the origin page, arm the Continue-Watching refresh).
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -110,23 +78,9 @@ pub(crate) fn default_port() -> u16 {
     crate::capture::default_port() + 10
 }
 
-/// Command tokens the API thread has posted, drained once per frame by `run::ingest`.
-static PENDING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
-/// Staged plays: the rk the client asked for → the `PmsMovie` fetched from PMS on the API
-/// thread, consumed (removed) by `handle` on the frame thread. A play whose fetch failed is
-/// never parked here, so a drained `api:play:<rk>` with no entry is a stale request.
-static PENDING_PLAYS: Mutex<Option<HashMap<String, plx_data::pms::PmsMovie>>> = Mutex::new(None);
 /// The last frame's snapshot, republished by `run::report` into a string the API thread
 /// hands back verbatim. `None` until the first frame (the app is booting).
 static SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
-/// The last frame's auth section (`GET /auth`; embedded in `/state` as `auth` too): the
-/// sign-in flow's phase, the offered "who's watching" roster (title, PIN flag, admin flag)
-/// and the flow's error line, republished alongside `SNAPSHOT`.
-static AUTH_SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
-/// The debug-flavour roster default: the "who's watching" screen is answered with the FIRST
-/// user (this household's admin) exactly once per app launch. `true` after the pick has been
-/// posted — or stays `false` for the whole launch when the flow never reached a roster.
-static PROFILE_DEFAULTED: AtomicBool = AtomicBool::new(false);
 static UP_SINCE: OnceLock<Instant> = OnceLock::new();
 
 /// Boot init: spawn the listener. Debug flavour only — see the module doc for the why.
@@ -150,24 +104,11 @@ pub(crate) fn init() {
     }
 }
 
-/// One command token: the API's write door. `run::ingest` calls this once per frame and
-/// feeds every token to `ingress_token` — the single input path.
+/// No-op: the HTTP write routes are gone (the FIFO is now the sole command path), so the
+/// frame loop's drain of this queue is a permanent empty loop. Kept as a stub so
+/// `run::ingest` compiles unchanged.
 pub(crate) fn take_pending() -> Vec<String> {
-    let mut guard = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_empty() {
-        return Vec::new();
-    }
-    guard.drain(..).collect()
-}
-
-/// Post one token to the frame loop. `tok` is bounded (a FIFO token, never a body).
-fn push(tok: String) {
-    let mut guard = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= 64 {
-        log("api: command queue full, dropping");
-        return;
-    }
-    guard.push_back(tok);
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +241,11 @@ fn reply(mut stream: &TcpStream, status: u16, body: &str) {
     let _ = stream.write_all(body.as_bytes());
 }
 
-/// Route one request. `path` is the raw request target (no query strings in this API).
-fn route(method: &str, path: &str, body: &str, port: u16) -> (u16, String) {
+/// Route one request. The HTTP surface is READ-ONLY: the three answer-from-`SNAPSHOT`
+/// endpoints, and 404/405 for everything else. Commands travel the FIFO (the single
+/// input path); the API no longer stages any `api:` token, so `body` is never parsed.
+/// `body` is kept in the signature so the caller (`serve`) is unchanged.
+fn route(method: &str, path: &str, _body: &str, port: u16) -> (u16, String) {
     match (path, method) {
         ("/health", "GET") => {
             let up = UP_SINCE.get().map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
@@ -320,20 +264,6 @@ fn route(method: &str, path: &str, body: &str, port: u16) -> (u16, String) {
             Some(s) => (200, s),
             None => (404, json!({"error": "no frame yet"}).to_string()),
         },
-        ("/play", "POST") => play(body),
-        ("/command", "POST") => command(body),
-        ("/pause", "POST") => passthrough("api:pause"),
-        ("/resume", "POST") => passthrough("api:resume"),
-        ("/stop", "POST") => passthrough("api:stop"),
-        ("/seek", "POST") => seek(body),
-        ("/audio", "POST") => track(body, "api:audio:"),
-        ("/sub", "POST") => track(body, "api:sub:"),
-        ("/quality", "POST") => quality(body),
-        ("/profile", "POST") => profile(body),
-        ("/auth", "GET") => match AUTH_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            Some(s) => (200, s),
-            None => (404, json!({"error": "no frame yet"}).to_string()),
-        },
         _ => {
             if method == "GET" {
                 (404, json!({"error": "no such route"}).to_string())
@@ -344,141 +274,6 @@ fn route(method: &str, path: &str, body: &str, port: u16) -> (u16, String) {
     }
 }
 
-/// `POST /play {"rk":"1234"}` — resolve the item from PMS ON THIS THREAD (never the
-/// frame thread), park it, post the token. The 404s distinguish "PMS does not hold it"
-/// from "the session has no token yet" so an agent knows which to retry.
-fn play(body: &str) -> (u16, String) {
-    let Some(rk) = body_field(body, "rk") else {
-        return (400, json!({"error": "missing \"rk\""}).to_string());
-    };
-    if !rk.bytes().all(|b| b.is_ascii_digit()) || rk.len() > 20 {
-        return (400, json!({"error": "\"rk\" must be a PMS ratingKey"}).to_string());
-    }
-    let client = plx_plex::plex::client();
-    let Some(meta) = client.metadata(&rk) else {
-        return (
-            404,
-            json!({"error": "PMS has no such item (or the session has no token yet — retry)"}).to_string(),
-        );
-    };
-    let sid = plx_media::route::surface_sid();
-    let pmm = plx_data::pms::parse_item(&meta, sid);
-    if pmm.part.is_empty() {
-        return (404, json!({"error": "item has no playable part"}).to_string());
-    }
-    {
-        let mut guard = PENDING_PLAYS.lock().unwrap_or_else(|e| e.into_inner());
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(rk.clone(), pmm);
-    }
-    let tok = format!("api:play:{rk}");
-    push(tok.clone());
-    (202, json!({"queued": tok}).to_string())
-}
-
-/// `POST /command {"tok":"pause"}` — verbatim passthrough into the token vocabulary:
-/// key names (`up`, `ok`, `stop`, …), `k:<sym>,<wcode>`, `txt:`, `pat:`, `wheel:`.
-fn command(body: &str) -> (u16, String) {
-    let Some(tok) = body_field(body, "tok") else {
-        return (400, json!({"error": "missing \"tok\""}).to_string());
-    };
-    if tok.len() > 256 || tok.is_empty() || tok.contains('\0') {
-        return (400, json!({"error": "\"tok\" out of bounds"}).to_string());
-    }
-    let tok = tok.clone();
-    push(tok.clone());
-    (202, json!({"queued": tok}).to_string())
-}
-
-fn passthrough(tok: &str) -> (u16, String) {
-    let tok = tok.to_string();
-    push(tok.clone());
-    (202, json!({"queued": tok}).to_string())
-}
-
-/// `POST /seek {"pos_ms":12345}`.
-fn seek(body: &str) -> (u16, String) {
-    let Some(ms) = body_num(body, "pos_ms") else {
-        return (400, json!({"error": "missing \"pos_ms\""}).to_string());
-    };
-    if ms < 0 || ms > 24 * 3600 * 1000 {
-        return (400, json!({"error": "\"pos_ms\" out of bounds"}).to_string());
-    }
-    let tok = format!("api:seek:{ms}");
-    push(tok.clone());
-    (202, json!({"queued": tok}).to_string())
-}
-
-/// `POST /audio {"sid":2}` / `POST /sub {"sid":3}` — a PMS `Stream.id` (the `sid`s in
-/// `/state`'s track lists).
-fn track(body: &str, prefix: &str) -> (u16, String) {
-    let Some(sid) = body_num(body, "sid") else {
-        return (400, json!({"error": "missing \"sid\""}).to_string());
-    };
-    let tok = format!("{prefix}{sid}");
-    push(tok.clone());
-    (202, json!({"queued": tok}).to_string())
-}
-
-/// `POST /quality {"q":"720p_4_mbps"}` — a rung of the playback-quality ladder, by its
-/// persisted spelling (the `PlaybackQuality` wire names — the file-format contract, so the
-/// API and the settings screen can never name the same rung differently). A rung that does
-/// not parse is a 400: an agent's typo never reaches the frame thread.
-fn quality(body: &str) -> (u16, String) {
-    let Some(q) = body_field(body, "q") else {
-        return (400, json!({"error": "missing \"q\""}).to_string());
-    };
-    if serde_json::from_value::<plx_media::route::Quality>(serde_json::Value::String(q.clone())).is_err() {
-        return (
-            400,
-            json!({"error": "unknown rung (want auto | original | 1080p_20_mbps | 1080p_8_mbps | 720p_4_mbps | 720p_2_mbps | 480p_720_kbps)"}).to_string(),
-        );
-    }
-    let tok = format!("api:quality:{q}");
-    push(tok.clone());
-    (202, json!({"queued": tok}).to_string())
-}
-
-/// `POST /profile {"index":0[, "pin":"1234"]}` — a pick of the "who's watching" roster,
-/// as `/auth`'s `profiles` index it. The PIN is the digits the roster row asks for (its
-/// `pin` flag is `true`); a profile that needs none refuses a supplied PIN the same way the
-/// screen does.
-fn profile(body: &str) -> (u16, String) {
-    let Some(index) = body_num(body, "index") else {
-        return (400, json!({"error": "missing \"index\""}).to_string());
-    };
-    if index < 0 || index > 63 {
-        return (400, json!({"error": "\"index\" out of bounds (see /auth)"}).to_string());
-    }
-    let pin = body_field(body, "pin").unwrap_or_default();
-    if !pin.is_empty() && (!pin.bytes().all(|b| b.is_ascii_digit()) || pin.len() > 8) {
-        return (400, json!({"error": "\"pin\" must be digits (at most 8)"}).to_string());
-    }
-    let tok = format!("api:profile:{index}:{}", if pin.is_empty() { "-" } else { pin.as_str() });
-    push(tok.clone());
-    (202, json!({"queued": tok}).to_string())
-}
-
-// Minimal JSON field reads — the bodies are single-key literals the agent composes;
-// `serde_json::Value` is the parser, nothing is deserialised into typed structs.
-fn body_value(body: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    Some(v.as_object()?.clone())
-}
-
-fn body_field(body: &str, key: &str) -> Option<String> {
-    let v = body_value(body)?;
-    v.get(key)?
-        .as_str()?
-        .trim()
-        .to_string()
-        .into()
-}
-
-fn body_num(body: &str, key: &str) -> Option<i64> {
-    let v = body_value(body)?;
-    v.get(key)?.as_i64()
-}
 
 // ---------------------------------------------------------------------------
 // Frame-thread half
@@ -494,7 +289,9 @@ pub(crate) unsafe fn handle(app: &mut crate::app::App, fr: &mut crate::app::run:
         None => (spec, ""),
     };
     match kind {
-        "play" => handle_play(app, fr, arg),
+        // `api:play` and `api:profile` are gone: both needed the HTTP write path (a PMS
+        // resolve parked on the API thread, and a `/auth` to read the outcome). With the
+        // HTTP surface read-only, neither can be armed from a FIFO token.
         "pause" => handle_transport(app, fr, false),
         "resume" => handle_transport(app, fr, true),
         "stop" => handle_stop(app, fr),
@@ -508,54 +305,8 @@ pub(crate) unsafe fn handle(app: &mut crate::app::App, fr: &mut crate::app::run:
         "audio" => handle_track(app, fr, arg, true),
         "sub" => handle_track(app, fr, arg, false),
         "quality" => handle_quality(app, fr, arg),
-        "profile" => handle_profile(app, fr, arg),
         _ => false,
     }
-}
-
-/// The headless play ritual — the same three calls the dev live-play scenario makes, in
-/// the same order: request the item (which owns the resolve), ask for its detail (the
-/// HUD's context), then seat the engine.
-unsafe fn handle_play(
-    app: &mut crate::app::App,
-    _fr: &mut crate::app::run::Frame,
-    rk: &str,
-) -> bool {
-    let Some(pmm) = PENDING_PLAYS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-        .and_then(|map| map.remove(rk))
-    else {
-        log(&format!("api: play rk {rk}: no staged item (stale request)"));
-        return false;
-    };
-    let ctx = format!("api play rk {rk}");
-    let requested = plx_media::route::request_play_movie(
-        &mut app.player.session,
-        app.bridge.metadata_mut(),
-        &pmm,
-        &ctx,
-    );
-    if requested {
-        app.bridge.metadata_mut().run(
-            plx_data::stores::metadata::MetadataCmd::RequestDetail {
-                sid: pmm.sid,
-                rk: pmm.rk.clone(),
-            },
-        );
-        crate::app::playback::start_playback(
-            &mut app.player.session,
-            &mut app.adapters.player,
-            0,
-            crate::app::playback::Origin::Here,
-            plx_screens::player::input::HUD_HEADLESS_MS,
-            None,
-            &mut app.pages,
-            &mut app.bridge,
-        );
-    }
-    requested
 }
 
 /// `api:pause` / `api:resume` — the transport key's effect, performed directly on the frame
@@ -677,32 +428,6 @@ unsafe fn handle_quality(
     true
 }
 
-/// `api:profile:<index>[:<pin>|-]` — commit a roster pick through the session machine\u2019s own
-/// command (the same commit the roster\u2019s rows land in). The pick moves the flow to Switching;
-/// its outcome is visible in `GET /auth` (phase, error).
-unsafe fn handle_profile(
-    app: &mut crate::app::App,
-    _fr: &mut crate::app::run::Frame,
-    arg: &str,
-) -> bool {
-    let Some((idx, pin)) = arg.split_once(':') else {
-        return false;
-    };
-    let Ok(index) = idx.parse::<usize>() else {
-        return false;
-    };
-    let pin = (pin != "-").then(|| pin.to_string());
-    log(&format!(
-        "api: profile: select index {index} (pin {})",
-        if pin.is_some() { "given" } else { "none" }
-    ));
-    crate::app::bridge::execute_session_command(
-        &mut app.pages,
-        plx_session::auth::SessionCmd::SelectProfile { index, pin },
-    );
-    true
-}
-
 /// Republish the snapshot, called from `run::report` once per frame. The string form is
 /// what `GET /state` answers verbatim; building it here (frame thread) means the API
 /// thread never borrows the app.
@@ -720,46 +445,6 @@ pub(crate) unsafe fn publish(app: &mut crate::app::App, fr: &mut crate::app::run
         plx_media::player::PlaybackState::Error => "error",
     };
     let views = app.bridge.views();
-    // The debug-flavour roster default (the user\u2019s rule): the \u201cwho\u2019s watching\u201d screen is
-    // answered with the FIRST user \u2014 this household\u2019s admin \u2014 exactly once per app launch, so a
-    // debug install never sits on the picker. The flow\u2019s own phase change (Profiles \u2192
-    // Switching) ends the condition; the flag keeps a refused pick from re-posting every frame.
-    // An explicit `POST /profile` still reaches every other user.
-    if plx_base::paths::flavour() == Some("debug") {
-        let snap = views.auth.0;
-        if snap.phase == plx_session::auth::Phase::Profiles
-            && !snap.users.is_empty()
-            && !PROFILE_DEFAULTED.swap(true, Ordering::Relaxed)
-        {
-            // The user's own name stays OUT of the event log: the scrub gate bans the `.title`
-            // spelling in a log call (household identity is scrubbed at write time anyway).
-            log(&format!(
-                "api: roster: auto-selecting first user (user 1 of {})",
-                snap.users.len()
-            ));
-            push("api:profile:0:-".to_string());
-        }
-    }
-    // This frame\u2019s auth section: `GET /auth`\u2019s answer, and what `/state` embeds under `auth`.
-    let auth = {
-        let snap = views.auth.0;
-        json!({
-            "phase": format!("{:?}", snap.phase).to_lowercase(),
-            "error": if snap.error.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(snap.error.to_string())
-            },
-            "profiles": snap.users.iter().enumerate().map(|(i, u)| {
-                json!({
-                    "index": i,
-                    "title": u.title,
-                    "pin": u.protected,
-                    "admin": u.admin,
-                })
-            }).collect::<Vec<_>>(),
-        })
-    };
     let now = views.metadata.now_playing();
     let playing = views.metadata.playing();
     let tracks = |item: Option<&plx_data::metadata::PlayingItem>, audio: bool| -> Vec<serde_json::Value> {
@@ -789,7 +474,7 @@ pub(crate) unsafe fn publish(app: &mut crate::app::App, fr: &mut crate::app::run
         }).collect()
     };
     let verdict = plx_media::route::play_verdict(ps).map(|s| s.to_string());
-    let mut obj = json!({
+    let obj = json!({
         "t": fr.now,
         "state": state_name,
         "state_id": st as u8,
@@ -811,9 +496,6 @@ pub(crate) unsafe fn publish(app: &mut crate::app::App, fr: &mut crate::app::run
         "audio": tracks(playing, true),
         "subs": tracks(playing, false),
     });
-    obj["auth"] = auth.clone();
-    let json = obj.to_string();
-    *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(json);
-    *AUTH_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(auth.to_string());
+    *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj.to_string());
     let _ = UP_SINCE.get_or_init(Instant::now);
 }

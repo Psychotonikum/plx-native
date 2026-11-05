@@ -704,8 +704,10 @@ unsafe fn ingress_token(app: &mut App, fr: &mut Frame, token: &str) -> bool {
         probe.run();
         return true;
     }
-    // The command API's own verbs (`api:play` / `api:seek` / `api:audio` / `api:sub`) need
-    // the whole App and drive no SDL: they perform here, where the `&mut` is.
+    // The command API's own verbs (`api:seek` / `api:audio` / `api:sub` / `api:pause` /
+    // `api:resume` / `api:stop` / `api:quality`) need the whole App and drive no SDL: they
+    // perform here, where the `&mut` is. `api:play` and `api:profile` are gone (the HTTP
+    // write path that armed them is read-only now).
     if let Some(spec) = token.strip_prefix("api:") {
         return crate::api::handle(app, fr, spec);
     }
