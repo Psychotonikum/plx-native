@@ -1325,7 +1325,48 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
             finish_preview_open_failure(ps, pa);
             return;
         }
-        fail_or_wait_for_recovery(ps, eng);
+        // The conditional codec probe: the demuxer refused a stream whose BYTES disagree with the
+        // Load's declaration — a stale PMS track list (a file replaced under the server, never
+        // re-analyzed) or a transcode whose output the route described from the source's record —
+        // and recorded what the file really carries. Reload ONCE with the corrected declaration:
+        // a healthy open never sets the probe, so a healthy start pays nothing for this.
+        let probe_v = SHARED.probe_actual_v.swap(0, Acquire);
+        let probe_a = SHARED.probe_actual_a.swap(0, Acquire);
+        if (probe_v != 0 || probe_a != 0) && crate::route::take_codec_probe_retry(ps) {
+            if probe_v != 0 {
+                let v = match probe_v {
+                    1 => "h264",
+                    2 => "hevc",
+                    3 => "av1",
+                    _ => "vp9",
+                };
+                crate::route::set_stream_vcodec(ps, v);
+            }
+            if probe_a != 0 {
+                let a = match probe_a {
+                    1 => "ac3",
+                    2 => "eac3",
+                    3 => "aac",
+                    _ => "dts",
+                };
+                crate::route::set_stream_acodec(ps, a);
+            }
+            crate::player::log(&format!(
+                "probe retry: the demuxer refused a stale declaration (video probe={probe_v}, audio probe={probe_a}); one reload with the codec the file really carries"
+            ));
+            // `reload_at` tears the failed Engine down — Starting -> Prepared keeps the same
+            // transaction, so the retry mints a fresh attempt — reopens the same URL and
+            // re-issues the Load with the corrected payload. Its teardown also clears
+            // `demux_failed`, so this hook cannot re-fire for the attempt it is correcting;
+            // if the corrected Load is refused too, the one-shot guard hands the next
+            // mismatch to the ordinary failure read-out instead of a loop.
+            settle_reload(
+                super::engine::reload_at(ps, pa, 0),
+                "probe retry reload",
+            );
+        } else {
+            fail_or_wait_for_recovery(ps, eng);
+        }
         return;
     }
     let stream = matches!(eng.source, Source::Stream);
