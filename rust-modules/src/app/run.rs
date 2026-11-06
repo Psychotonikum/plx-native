@@ -670,8 +670,9 @@ pub(crate) unsafe fn ingest(app: &mut App, fr: &mut Frame) {
             let ok = !supplied && ingress_token(app, fr, &command.token);
             crate::lab::command_done(command.id, ok);
         }
-        // The command API (api.rs, unconditional in every build) stages its commands here;
-        // the same single input path as the FIFO and the lab channel.
+        // The command API's internal stage (api.rs): the roster auto-default and the
+        // play-staging worker post their tokens here; the same single input path as the
+        // FIFO and the lab channel (the FIFO's own tokens are drained below).
         for tok in crate::api::take_pending() {
             if !supplied { let _ = ingress_token(app, fr, &tok); }
         }
