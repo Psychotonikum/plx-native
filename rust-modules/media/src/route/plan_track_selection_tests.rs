@@ -908,3 +908,19 @@ fn the_encoder_names_the_default_when_nothing_stands_in() {
     assert_eq!(encode_audio_id(true, 0, 0, &tracks, none), 2);
     assert_eq!(encode_audio_id(true, 0, 0, &[], none), 0);
 }
+
+#[test]
+fn the_load_declaration_maps_every_dts_spelling_to_the_payload_name() {
+    // PMS writes the DTS family as `dca` / `dca-ma` / `dca_ma`; the demuxer feeds DTS core
+    // bytes for all of them, and the start guard's payload table knows only `dts`. A
+    // declaration that carries a PMS spelling as-is (the no-pick `src_acodec` of a DTS
+    // title) would be refused at Load — the Akira-class silent error.
+    for codec in ["dts", "dca", "dca-ma", "dca_ma", "dts_ma", "dtshd", "DTS", "DCA"] {
+        assert_eq!(audio_declaration(codec), "dts", "{codec}");
+    }
+    // the payload table's other names and a pass-through survive (case-normalised)
+    assert_eq!(audio_declaration("eac3"), "eac3");
+    assert_eq!(audio_declaration("ac3"), "ac3");
+    assert_eq!(audio_declaration("aac"), "aac");
+    assert_eq!(audio_declaration("TrueHD"), "truehd");
+}
