@@ -3065,12 +3065,12 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
             #[cfg(feature = "devtriggers")]
             let api_wait = app.menu_play_await.as_ref().is_some_and(super::input::MenuPlayAwait::is_api);
             #[cfg(feature = "devtriggers")]
-            let generation_before = plx_media::route::playback_trace_generation();
+            let request_before = app.player.session.metric_request();
             menu_play_tick(&mut app.player.session, &mut app.adapters.player,
                 &mut app.pages, &mut app.runtime.bridge(&mut app.bridge), &mut app.menu_play_await, fr.now);
             #[cfg(feature = "devtriggers")]
             if api_wait && app.menu_play_await.is_none() {
-                super::api::play_wait_finished(generation_before);
+                super::api::play_wait_finished(request_before, app.player.session.metric_request());
             }
         }
         // Server-side view-state WRITES (Mark as Watched / Unwatched, Remove from Deck): send

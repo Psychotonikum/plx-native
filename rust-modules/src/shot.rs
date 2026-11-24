@@ -170,11 +170,11 @@ pub(crate) fn request() {
 /// Encode a read-back buffer as PNG in memory. `image::save_buffer` does the same work for a
 /// path; the on-demand capture keeps the bytes in memory so the numbered file lands with the
 /// encode and the write as one step.
-fn encode_png(rgb: &[u8], w: u32, h: u32, color: image::ColorType) -> Vec<u8> {
+fn encode_png(rgb: &[u8], w: u32, h: u32, color: image::ColorType) -> image::ImageResult<Vec<u8>> {
     use image::ImageEncoder;
     let mut out: Vec<u8> = Vec::new();
-    let _ = image::codecs::png::PngEncoder::new(&mut out).write_image(rgb, w, h, color.into());
-    out
+    image::codecs::png::PngEncoder::new(&mut out).write_image(rgb, w, h, color.into())?;
+    Ok(out)
 }
 
 /// `dir/stem-N.ext`, N counting up per on-demand shot within this process.
@@ -318,8 +318,11 @@ pub(crate) fn maybe_capture(now: u32, busy: bool, last_change_ms: u32, vx: c_int
         // The on-demand capture keeps its encode in memory (encode, then one write) so the
         // numbered file and the log line that names it come from the same bytes. Automatic
         // captures (simulator) have no such pairing and keep `save_buffer`.
-        let png = encode_png(&rgb, w as u32, h as u32, color);
-        match std::fs::write(&out, &png) {
+        let written = encode_png(&rgb, w as u32, h as u32, color)
+            .map_err(|error| error.to_string())
+            .and_then(|png| plx_plex::plex::session::write_atomic(&out, &png)
+                .map_err(|error| format!("{error:?}")));
+        match written {
             Ok(()) => {
                 plx_base::eventlog::log(&format!("shot: wrote {}x{} to {}", w, h, out.display()));
                 // The typed shot read parked on this request answers with the numbered file.

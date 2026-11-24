@@ -10,6 +10,7 @@ use std::time::Instant;
 use serde_json::json;
 
 use plx_base::eventlog::log;
+use plx_media::player::backend::LogicalRequestId;
 
 static PENDING: Mutex<VecDeque<socket::Request>> = Mutex::new(VecDeque::new());
 
@@ -22,7 +23,7 @@ enum What {
     /// staging failure, or the deadline.
     Play {
         rk: String,
-        generation: Option<u32>,
+        request: Option<LogicalRequestId>,
     },
     /// `seek:<ms>` — answers `seek_landed` once the engine has ACTUALLY sought
     /// (`seen_seeking` — it enters `seeking` on the frame `request_seek` runs) AND the
@@ -107,16 +108,18 @@ fn drop_plays(reason: &str) {
     *guard = keep;
 }
 /// Correlate the shared play continuation with the route generation it started.
-pub(super) fn play_wait_finished(before: u32) {
-    let after = plx_media::route::playback_trace_generation();
-    if before == after {
+pub(super) fn play_wait_finished(
+    before: Option<LogicalRequestId>,
+    after: Option<LogicalRequestId>,
+) {
+    let Some(after) = after.filter(|after| Some(*after) != before) else {
         drop_plays("the item could not be played");
         return;
-    }
+    };
     let mut waiting = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
-    for request in waiting.iter_mut() {
-        if let What::Play { generation, .. } = &mut request.what {
-            *generation = Some(after);
+    for entry in waiting.iter_mut() {
+        if let What::Play { request, .. } = &mut entry.what {
+            *request = Some(after);
         }
     }
 }
@@ -173,14 +176,16 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
     let mut keep = VecDeque::new();
     while let Some(mut f) = guard.pop_front() {
         let r = match &mut f.what {
-            What::Play { rk, generation } => {
-                let current = plx_media::route::playback_trace_generation();
-                if generation.map_or(!api_wait, |generation| generation != current) {
+            What::Play { rk, request } => {
+                use plx_media::player::PlaybackState;
+                let current = ps.metric_request();
+                let failed = request.is_some() && current.is_none() && st == PlaybackState::Error;
+                if !failed && request.map_or(!api_wait, |request| Some(request) != current) {
                     Some(socket::Reply::ok(socket::Outcome::PlayFailed {
                         rk: rk.clone(),
                         reason: "superseded by another playback route".to_string(),
                     }))
-                } else if generation.is_some() && st == plx_media::player::PlaybackState::Playing {
+                } else if request.is_some() && st == PlaybackState::Playing {
                     let title = views
                         .metadata
                         .now_playing()
@@ -190,12 +195,8 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
                         rk: rk.clone(),
                         title,
                     }))
-                } else if generation.is_some()
-                    && matches!(
-                        st,
-                        plx_media::player::PlaybackState::Error
-                            | plx_media::player::PlaybackState::Idle
-                    )
+                } else if request.is_some()
+                    && matches!(st, PlaybackState::Error | PlaybackState::Idle)
                 {
                     let verdict = plx_media::route::play_verdict(ps).map(|s| s.to_string());
                     Some(socket::Reply::ok(socket::Outcome::PlayFailed {
@@ -469,13 +470,7 @@ pub(crate) unsafe fn execute_request(
             // this acceptance.
             let accepted = handle_play(app, fr, &rk);
             if accepted {
-                arm_awaiting(
-                    reply.clone(),
-                    What::Play {
-                        rk,
-                        generation: None,
-                    },
-                );
+                arm_awaiting(reply.clone(), What::Play { rk, request: None });
             } else {
                 answer(Reply::ok(Outcome::PlayFailed {
                     rk,
