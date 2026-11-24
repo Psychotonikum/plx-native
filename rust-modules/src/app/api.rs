@@ -5,7 +5,6 @@ mod socket;
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
 use serde_json::json;
 
@@ -56,24 +55,24 @@ enum What {
 /// One parked typed request: the id its answer must echo, and the instant it parked.
 struct InFlight {
     reply: socket::ReplyTo,
-    since: Instant,
+    since_ms: u32,
     what: What,
 }
 /// In-flight horizons: a play that never seats, a seek that never lands, a switch that
 /// never settles, a capture that never fires — each answers its `*failed` outcome at the
 /// deadline instead of leaving the client hanging.
-const AWAIT_PLAY_SECS: u64 = 120;
-const AWAIT_SEEK_SECS: u64 = 10;
-const AWAIT_TRANSPORT_SECS: u64 = 10;
-const AWAIT_PROFILE_SECS: u64 = 60;
-const AWAIT_SHOT_SECS: u64 = 10;
+const AWAIT_PLAY_SECS: u32 = 120;
+const AWAIT_SEEK_SECS: u32 = 10;
+const AWAIT_TRANSPORT_SECS: u32 = 10;
+const AWAIT_PROFILE_SECS: u32 = 60;
+const AWAIT_SHOT_SECS: u32 = 10;
 /// The parked table is bounded like the command queue: a flooded client cannot park the
 /// frame thread with an unbounded table. The overflow answers the OLDEST entry with
 /// `queue_full` (its id still has to be echoed exactly once).
 const AWAITING_MAX: usize = 16;
 /// Park one typed request for its later outcome — no response now; the OUTCOME is the
 /// response.
-fn arm_awaiting(reply: socket::ReplyTo, what: What) {
+fn arm_awaiting(reply: socket::ReplyTo, now_ms: u32, what: What) {
     let mut guard = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= AWAITING_MAX {
         let Some(old) = guard.pop_front() else {
@@ -85,7 +84,7 @@ fn arm_awaiting(reply: socket::ReplyTo, what: What) {
     }
     guard.push_back(InFlight {
         reply,
-        since: Instant::now(),
+        since_ms: now_ms,
         what,
     });
 }
@@ -157,7 +156,11 @@ fn resolve_shot(r: socket::Reply) {
 /// title together, which is exactly the data every parked request's answer needs. An
 /// entry resolves when the frame it waited for has arrived; the response goes over the
 /// socket under the entry's id.
-unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::PlaybackState) {
+unsafe fn resolve_awaiting(
+    app: &mut crate::app::App,
+    st: plx_media::player::PlaybackState,
+    now_ms: u32,
+) {
     let mut guard = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_empty() {
         return;
@@ -172,7 +175,6 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
     let auth = views.auth.0;
     let state_name = state_str(st);
     let pos_ms = plx_media::player::playpos_ns(ps).unwrap_or(0) / 1_000_000;
-    let now = Instant::now();
     let mut keep = VecDeque::new();
     while let Some(mut f) = guard.pop_front() {
         let r = match &mut f.what {
@@ -206,9 +208,7 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
                             verdict.unwrap_or_else(|| "none".to_string())
                         ),
                     }))
-                } else if now.duration_since(f.since)
-                    > std::time::Duration::from_secs(AWAIT_PLAY_SECS)
-                {
+                } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_PLAY_SECS * 1_000 {
                     Some(socket::Reply::ok(socket::Outcome::PlayFailed {
                         rk: rk.clone(),
                         reason: format!(
@@ -241,9 +241,7 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
                         ms: *ms,
                         pos_ms,
                     }))
-                } else if now.duration_since(f.since)
-                    > std::time::Duration::from_secs(AWAIT_SEEK_SECS)
-                {
+                } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_SEEK_SECS * 1_000 {
                     Some(socket::Reply::ok(
                         socket::Outcome::SeekFailed {
                             ms: *ms,
@@ -266,9 +264,7 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
                     Some(socket::Reply::ok(socket::Outcome::Resumed))
                 } else if !*play && st == PlaybackState::Paused {
                     Some(socket::Reply::ok(socket::Outcome::Paused))
-                } else if now.duration_since(f.since)
-                    > std::time::Duration::from_secs(AWAIT_TRANSPORT_SECS)
-                {
+                } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_TRANSPORT_SECS * 1_000 {
                     Some(socket::Reply::err(socket::ApiError::Internal {
                         reason: format!("transport did not settle (state {state_name})"),
                     }))
@@ -325,9 +321,7 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
                         reason: format!("the flow left the switch (phase {:?})", auth.phase)
                             .to_lowercase(),
                     }))
-                } else if now.duration_since(f.since)
-                    > std::time::Duration::from_secs(AWAIT_PROFILE_SECS)
-                {
+                } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_PROFILE_SECS * 1_000 {
                     // Still on the roster or still switching after the horizon: the
                     // switch will not land.
                     Some(socket::Reply::ok(
@@ -345,7 +339,7 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
                 }
             }
             What::Shot => {
-                if now.duration_since(f.since) > std::time::Duration::from_secs(AWAIT_SHOT_SECS) {
+                if now_ms.wrapping_sub(f.since_ms) >= AWAIT_SHOT_SECS * 1_000 {
                     Some(socket::Reply::ok(socket::Outcome::ShotFailed {
                         reason: format!("no capture within {AWAIT_SHOT_SECS} s"),
                     }))
@@ -364,10 +358,10 @@ unsafe fn resolve_awaiting(app: &mut crate::app::App, st: plx_media::player::Pla
     }
     *guard = keep;
 }
-static UP_SINCE: OnceLock<Instant> = OnceLock::new();
+static UP_SINCE: OnceLock<u32> = OnceLock::new();
 
 pub(super) fn init() {
-    let _ = UP_SINCE.get_or_init(Instant::now);
+    let _ = UP_SINCE.get_or_init(super::clock::now);
     socket::start();
 }
 
@@ -470,7 +464,7 @@ pub(crate) unsafe fn execute_request(
             // this acceptance.
             let accepted = handle_play(app, fr, &rk);
             if accepted {
-                arm_awaiting(reply.clone(), What::Play { rk, request: None });
+                arm_awaiting(reply.clone(), fr.now, What::Play { rk, request: None });
             } else {
                 answer(Reply::ok(Outcome::PlayFailed {
                     rk,
@@ -492,6 +486,7 @@ pub(crate) unsafe fn execute_request(
                     {
                         arm_awaiting(
                             reply.clone(),
+                            fr.now,
                             What::Seek {
                                 ms,
                                 generation: plx_media::route::playback_trace_generation(),
@@ -566,6 +561,7 @@ pub(crate) unsafe fn execute_request(
                 // the flow moving on without the pick.
                 arm_awaiting(
                     reply.clone(),
+                    fr.now,
                     What::Profile {
                         index,
                         from: auth_phase,
@@ -579,6 +575,7 @@ pub(crate) unsafe fn execute_request(
             if handle_transport(app, fr, play) {
                 arm_awaiting(
                     reply.clone(),
+                    fr.now,
                     What::Transport {
                         play,
                         generation: plx_media::route::playback_trace_generation(),
@@ -603,7 +600,7 @@ pub(crate) unsafe fn execute_request(
             // Parked: the response is the CAPTURE (the numbered PNG, written on the
             // frame swap after this one) or the capture's refusal — not this request.
             crate::shot::request();
-            arm_awaiting(reply.clone(), What::Shot);
+            arm_awaiting(reply.clone(), fr.now, What::Shot);
         }
     }
 }
@@ -818,9 +815,9 @@ unsafe fn commit_profile(app: &mut crate::app::App, index: usize, pin: Option<St
     );
 }
 
-pub(super) unsafe fn publish(app: &mut super::App) {
+pub(super) unsafe fn publish(app: &mut super::App, now_ms: u32) {
     let st = plx_media::player::state(&app.player.session);
-    resolve_awaiting(app, st);
+    resolve_awaiting(app, st, now_ms);
 }
 
 fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
@@ -865,7 +862,7 @@ fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
             .map(|(i, s)| {
                 let mut o = json!({
                     "sid": s.id,
-                    "ord": plx_data::metadata::audio_ordinal(&list, i),
+                    "ord": plx_data::metadata::audio_ordinal(list, i),
                     "codec": s.codec,
                     "lang": s.lang,
                     "title": s.title,
@@ -891,7 +888,7 @@ fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
     }
     let mut obj = json!({
         "t": fr.now,
-        "up_ms": UP_SINCE.get().map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
+        "up_ms": UP_SINCE.get().map_or(0, |start| fr.now.wrapping_sub(*start)),
         "state": state_name,
         "state_id": st as u8,
         "playing": plx_media::player::is_playing(ps),

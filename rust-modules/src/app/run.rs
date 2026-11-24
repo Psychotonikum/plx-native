@@ -3489,7 +3489,7 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
     // (api.rs — frame thread builds the string, the API thread only serves it). The door is
     // devtrig-only, so is this line: a non-devtriggers build builds no snapshot at all.
     #[cfg(feature = "devtriggers")]
-    super::api::publish(app);
+    super::api::publish(app, fr.now);
         // dev: the stress-bench oscillators' own frame-time accumulator — right after Swap is
         // stamped (`present_and_swap`, just above this call in `run()`), the earliest point this
         // iteration's total is known. See `crate::dev::scenarios::bench_frame_tick`'s doc.
