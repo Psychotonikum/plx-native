@@ -931,13 +931,17 @@ unsafe fn present_and_swap(app: &mut App, fr: &mut Frame, pace: Option<u64>) {
         let scenarios_pending = app.scenarios.shots.pending();
         #[cfg(all(not(feature = "sim"), feature = "devtriggers"))]
         let scenarios_pending = false;
+        #[cfg(feature = "devtriggers")]
+        let api_shot = super::api::shot_pending(&app.api_waiting);
+        #[cfg(all(feature = "sim", not(feature = "devtriggers")))]
+        let api_shot = false;
         #[cfg(any(feature = "sim", feature = "devtriggers"))]
         if screenshot_seam && crate::shot::maybe_capture(fr.now, app.pages.present.changed_after_admission()
             || app.pages.budget.has_queued_work() || plx_gfx::gfx::snapshot_pending()
-            || scenarios_pending, shot_last_change, _vx, _vy, _vw, _vh,
+            || scenarios_pending, shot_last_change, _vx, _vy, _vw, _vh, api_shot,
             |result| {
                 #[cfg(feature = "devtriggers")]
-                super::api::shot_completed(result);
+                super::api::shot_completed(&mut app.api_waiting, result, plx_media::player::state(&app.player.session));
                 #[cfg(not(feature = "devtriggers"))]
                 drop(result);
             }) {
@@ -1095,6 +1099,7 @@ unsafe fn ingress_token(app: &mut App, fr: &mut Frame, token: &str) -> bool {
     }
     #[cfg(feature = "devtriggers")]
     if let Some(spec) = token.strip_prefix("api:") {
+        drain_sdl(app, fr);
         return super::api::handle(app, fr, spec);
     }
     // Keys and clicks use SDL's existing synthesis while coexistence lasts. Consume those
@@ -3070,7 +3075,8 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
                 &mut app.pages, &mut app.runtime.bridge(&mut app.bridge), &mut app.menu_play_await, fr.now);
             #[cfg(feature = "devtriggers")]
             if api_wait && app.menu_play_await.is_none() {
-                super::api::play_wait_finished(request_before, app.player.session.metric_request());
+                super::api::play_wait_finished(&mut app.api_waiting, request_before, app.player.session.metric_request(),
+                    plx_media::player::state(&app.player.session));
             }
         }
         // Server-side view-state WRITES (Mark as Watched / Unwatched, Remove from Deck): send
@@ -4158,6 +4164,8 @@ pub(in crate::app) mod lifecycle_regression_tests {
             last_route_reported: Default::default(),
             ptr: Pointer::IDLE,
             menu_play_await: Default::default(),
+            #[cfg(feature = "devtriggers")]
+            api_waiting: Default::default(),
             deeplink: Default::default(),
             prev: Default::default(),
             refresh_hubs: Default::default(),

@@ -1550,6 +1550,8 @@ pub(crate) unsafe fn construct(
         last_route_reported,
         ptr,
         menu_play_await: None,
+        #[cfg(feature = "devtriggers")]
+        api_waiting: Default::default(),
         deeplink: Default::default(),
         prev,
         refresh_hubs,

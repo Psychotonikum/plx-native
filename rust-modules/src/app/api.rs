@@ -10,11 +10,10 @@ use serde_json::json;
 
 use plx_base::eventlog::log;
 use plx_media::player::backend::LogicalRequestId;
+use plx_media::player::PlaybackState;
 
 static PENDING: Mutex<VecDeque<socket::Request>> = Mutex::new(VecDeque::new());
 
-/// Requests waiting for the owning player, session or screenshot code to settle.
-static AWAITING: Mutex<VecDeque<InFlight>> = Mutex::new(VecDeque::new());
 /// What a parked request is waiting for.
 enum What {
     /// `play:<rk>` — answers `play_started` (with the title) on the first frame that
@@ -45,7 +44,8 @@ enum What {
     /// processed a frame or two after the pick) from a return to the roster.
     Profile {
         index: usize,
-        from: plx_session::auth::Phase,
+        uuid: String,
+        epoch: u64,
         seen_switching: bool,
     },
     /// `shot` — answers `shot_captured` when the numbered PNG is written (shot.rs) or
@@ -53,7 +53,7 @@ enum What {
     Shot,
 }
 /// One parked typed request: the id its answer must echo, and the instant it parked.
-struct InFlight {
+pub(super) struct InFlight {
     reply: socket::ReplyTo,
     since_ms: u32,
     what: What,
@@ -66,56 +66,55 @@ const AWAIT_SEEK_SECS: u32 = 10;
 const AWAIT_TRANSPORT_SECS: u32 = 10;
 const AWAIT_PROFILE_SECS: u32 = 60;
 const AWAIT_SHOT_SECS: u32 = 10;
-/// The parked table is bounded like the command queue: a flooded client cannot park the
-/// frame thread with an unbounded table. The overflow answers the OLDEST entry with
-/// `queue_full` (its id still has to be echoed exactly once).
+/// Frame-owned requests are admitted before their effects are committed.
 const AWAITING_MAX: usize = 16;
-/// Park one typed request for its later outcome — no response now; the OUTCOME is the
-/// response.
-fn arm_awaiting(reply: socket::ReplyTo, now_ms: u32, what: What) {
-    let mut guard = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= AWAITING_MAX {
-        let Some(old) = guard.pop_front() else {
-            return;
-        };
-        old.reply
-            .send(socket::Reply::err(socket::ApiError::QueueFull));
-        log("api: in-flight table full");
-    }
-    guard.push_back(InFlight {
+
+fn can_park(waiting: &VecDeque<InFlight>, verb: &socket::Verb) -> bool {
+    waiting.len() < AWAITING_MAX
+        && !waiting.iter().any(|entry| {
+            matches!(
+                (verb, &entry.what),
+                (socket::Verb::Profile { .. }, What::Profile { .. })
+                    | (socket::Verb::Shot, What::Shot)
+            )
+        })
+}
+
+fn arm_awaiting(waiting: &mut VecDeque<InFlight>, reply: socket::ReplyTo, now_ms: u32, what: What) {
+    waiting.push_back(InFlight {
         reply,
         since_ms: now_ms,
         what,
     });
 }
-/// Every parked play request answers now with the named reason: a stop or a newer play
-/// just bumped the play-intent generation, so their rituals can no longer run — the
-/// answer is due at the bump, not at the deadline.
-fn drop_plays(reason: &str) {
-    let mut guard = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
-    let mut keep = VecDeque::new();
-    while let Some(f) = guard.pop_front() {
-        if let What::Play { rk, .. } = f.what {
-            f.reply.send(socket::Reply::ok(socket::Outcome::PlayFailed {
-                rk,
-                reason: reason.to_string(),
-            }));
-        } else {
-            keep.push_back(f);
-        }
-    }
-    *guard = keep;
+
+fn drop_plays(waiting: &mut VecDeque<InFlight>, reason: &str, state: PlaybackState) {
+    waiting.retain(|entry| {
+        let What::Play { rk, .. } = &entry.what else {
+            return true;
+        };
+        entry.reply.send(
+            socket::Reply::ok(socket::Outcome::PlayFailed {
+                rk: rk.clone(),
+                reason: reason.to_owned(),
+            })
+            .with_state(state_str(state)),
+        );
+        false
+    });
 }
+
 /// Correlate the shared play continuation with the route generation it started.
 pub(super) fn play_wait_finished(
+    waiting: &mut VecDeque<InFlight>,
     before: Option<LogicalRequestId>,
     after: Option<LogicalRequestId>,
+    state: PlaybackState,
 ) {
     let Some(after) = after.filter(|after| Some(*after) != before) else {
-        drop_plays("the item could not be played");
+        drop_plays(waiting, "the item could not be played", state);
         return;
     };
-    let mut waiting = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
     for entry in waiting.iter_mut() {
         if let What::Play { request, .. } = &mut entry.what {
             *request = Some(after);
@@ -123,34 +122,33 @@ pub(super) fn play_wait_finished(
     }
 }
 
-/// A shot capture landed (shot.rs, frame thread): the parked shot read answers with the
-/// numbered file. A capture fired by the FIFO (no parked entry) is a no-op.
-fn shot_landed(path: String) {
-    resolve_shot(socket::Reply::ok(socket::Outcome::ShotCaptured { path }));
+/// An API shot waits in the same queue that owns its deadline.
+pub(super) fn shot_pending(waiting: &VecDeque<InFlight>) -> bool {
+    waiting.iter().any(|entry| matches!(entry.what, What::Shot))
 }
-/// A shot capture failed (shot.rs, frame thread): the parked shot read answers with the
-/// reason.
-fn shot_failed(reason: String) {
-    resolve_shot(socket::Reply::ok(socket::Outcome::ShotFailed { reason }));
-}
-pub(super) fn shot_completed(result: Result<String, String>) {
-    match result {
-        Ok(path) => shot_landed(path),
-        Err(reason) => shot_failed(reason),
+
+pub(super) fn shot_completed(
+    waiting: &mut VecDeque<InFlight>,
+    result: Result<String, String>,
+    state: PlaybackState,
+) {
+    let outcome = match result {
+        Ok(path) => socket::Outcome::ShotCaptured { path },
+        Err(reason) => socket::Outcome::ShotFailed { reason },
+    };
+    if let Some(index) = waiting
+        .iter()
+        .position(|entry| matches!(entry.what, What::Shot))
+    {
+        let request = waiting
+            .remove(index)
+            .expect("position came from the same queue");
+        request
+            .reply
+            .send(socket::Reply::ok(outcome).with_state(state_str(state)));
     }
 }
 
-/// The shot's answer goes to the OLDEST parked shot read and only to it: a capture is
-/// one-shot, and a second parked read that got no capture of its own answers at its
-/// deadline.
-fn resolve_shot(r: socket::Reply) {
-    let mut guard = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
-    let pos = guard.iter().position(|f| matches!(f.what, What::Shot));
-    if let Some(i) = pos {
-        let f = guard.remove(i).expect("position came from the same queue");
-        f.reply.send(r);
-    }
-}
 /// The per-frame half of the request→outcome correlation: [`publish`] calls this once
 /// per frame — the one place that reads the state, the position, the auth flow and the
 /// title together, which is exactly the data every parked request's answer needs. An
@@ -161,7 +159,7 @@ unsafe fn resolve_awaiting(
     st: plx_media::player::PlaybackState,
     now_ms: u32,
 ) {
-    let mut guard = AWAITING.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = &mut app.api_waiting;
     if guard.is_empty() {
         return;
     }
@@ -274,27 +272,32 @@ unsafe fn resolve_awaiting(
             }
             What::Profile {
                 index,
-                from,
+                uuid,
+                epoch,
                 seen_switching,
             } => {
-                // The switch is `profiles → switching → ready|error`: the `switching`
-                // leg is in progress, not a failure.
-                *seen_switching =
-                    *seen_switching || auth.phase == plx_session::auth::Phase::Switching;
-                if auth.phase == plx_session::auth::Phase::Ready {
-                    // Seated: the title from the seated profile itself (the roster may
-                    // already be cleared), falling back to the picked tile.
-                    let title = auth
-                        .profile
-                        .as_ref()
-                        .map(|p| p.title.clone())
-                        .or_else(|| auth.users.get(*index).map(|u| u.title.clone()))
-                        .unwrap_or_default();
-                    Some(socket::Reply::ok(socket::Outcome::ProfileSeated {
+                *seen_switching |=
+                    auth.flow_epoch == *epoch && auth.phase == plx_session::auth::Phase::Switching;
+                if auth.flow_epoch > *epoch {
+                    Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
                         index: *index,
-                        title,
+                        reason: "superseded by another session command".into(),
                     }))
-                } else if auth.phase == plx_session::auth::Phase::Error {
+                } else if auth.flow_epoch == *epoch && auth.phase == plx_session::auth::Phase::Ready
+                {
+                    let outcome = match auth.profile.as_ref().filter(|p| p.uuid == *uuid) {
+                        Some(profile) => socket::Outcome::ProfileSeated {
+                            index: *index,
+                            title: profile.title.clone(),
+                        },
+                        None => socket::Outcome::ProfileFailed {
+                            index: *index,
+                            reason: "the selected profile did not seat".into(),
+                        },
+                    };
+                    Some(socket::Reply::ok(outcome))
+                } else if auth.flow_epoch == *epoch && auth.phase == plx_session::auth::Phase::Error
+                {
                     Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
                         index: *index,
                         reason: if auth.error.is_empty() {
@@ -310,10 +313,12 @@ unsafe fn resolve_awaiting(
                         index: *index,
                         reason: "the flow returned to the roster without seating".to_string(),
                     }))
-                } else if !matches!(
-                    auth.phase,
-                    plx_session::auth::Phase::Profiles | plx_session::auth::Phase::Switching
-                ) {
+                } else if auth.flow_epoch == *epoch
+                    && !matches!(
+                        auth.phase,
+                        plx_session::auth::Phase::Profiles | plx_session::auth::Phase::Switching
+                    )
+                {
                     // Any other phase (idle, a re-sign-in in flight, erased local state)
                     // is the flow leaving the switch without this pick.
                     Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
@@ -324,16 +329,14 @@ unsafe fn resolve_awaiting(
                 } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_PROFILE_SECS * 1_000 {
                     // Still on the roster or still switching after the horizon: the
                     // switch will not land.
-                    Some(socket::Reply::ok(
-                        socket::Outcome::ProfileFailed {
-                            index: *index,
-                            reason: format!(
-                                "the switch did not land within {AWAIT_PROFILE_SECS} s (from {from:?}, now {:?})",
-                                auth.phase
-                            )
-                            .to_lowercase(),
-                        },
-                    ))
+                    Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
+                        index: *index,
+                        reason: format!(
+                            "the switch did not land within {AWAIT_PROFILE_SECS} s (now {:?})",
+                            auth.phase
+                        )
+                        .to_lowercase(),
+                    }))
                 } else {
                     None
                 }
@@ -455,7 +458,22 @@ pub(crate) unsafe fn execute_request(
     let no_engine = Reply::err(ApiError::NoEngine { state: st_name });
     // Every reply this frame produces is stamped with THIS frame's playback state — the
     // state the result belongs to (a reply is a judgment, not an acknowledgement).
-    let answer = |r: Reply| reply.send(r.with_state(st_name));
+    let answer = |app: &super::App, r: Reply| {
+        reply.send(r.with_state(state_str(plx_media::player::state(&app.player.session))));
+    };
+    if matches!(
+        req.verb,
+        Verb::Play { .. }
+            | Verb::Seek { .. }
+            | Verb::Profile { .. }
+            | Verb::Pause
+            | Verb::Resume
+            | Verb::Shot
+    ) && !can_park(&app.api_waiting, &req.verb)
+    {
+        answer(app, Reply::err(ApiError::QueueFull));
+        return;
+    }
     match req.verb {
         Verb::Play { rk } => {
             // Commit, then park: the response is the OUTCOME — the first playing frame,
@@ -464,12 +482,20 @@ pub(crate) unsafe fn execute_request(
             // this acceptance.
             let accepted = handle_play(app, fr, &rk);
             if accepted {
-                arm_awaiting(reply.clone(), fr.now, What::Play { rk, request: None });
+                arm_awaiting(
+                    &mut app.api_waiting,
+                    reply.clone(),
+                    fr.now,
+                    What::Play { rk, request: None },
+                );
             } else {
-                answer(Reply::ok(Outcome::PlayFailed {
-                    rk,
-                    reason: "no server or item selected".to_string(),
-                }));
+                answer(
+                    app,
+                    Reply::ok(Outcome::PlayFailed {
+                        rk,
+                        reason: "no server or item selected".to_string(),
+                    }),
+                );
             }
         }
         Verb::Seek { ms } => {
@@ -485,6 +511,7 @@ pub(crate) unsafe fn execute_request(
                         .request_seek(&mut app.player.session, ns)
                     {
                         arm_awaiting(
+                            &mut app.api_waiting,
                             reply.clone(),
                             fr.now,
                             What::Seek {
@@ -495,78 +522,113 @@ pub(crate) unsafe fn execute_request(
                             },
                         );
                     } else {
-                        answer(Reply::ok(Outcome::SeekFailed {
-                            ms,
-                            reason: "seek was refused".into(),
-                        }));
+                        answer(
+                            app,
+                            Reply::ok(Outcome::SeekFailed {
+                                ms,
+                                reason: "seek was refused".into(),
+                            }),
+                        );
                     }
                 } else {
-                    answer(Reply::err(ApiError::Internal {
-                        reason: "the seek target overflows nanoseconds".to_string(),
-                    }));
+                    answer(
+                        app,
+                        Reply::err(ApiError::Internal {
+                            reason: "the seek target overflows nanoseconds".to_string(),
+                        }),
+                    );
                 }
             } else {
-                answer(no_engine);
+                answer(app, no_engine);
             }
         }
         Verb::Audio { sid } => {
             let ok = handle_track(app, fr, &sid.to_string(), true);
-            answer(if ok {
-                Reply::ok(Outcome::TrackCommitted {
-                    track: "audio",
-                    sid,
-                })
-            } else {
-                Reply::err(ApiError::NoTrack { sid })
-            });
+            answer(
+                app,
+                if ok {
+                    Reply::ok(Outcome::TrackCommitted {
+                        track: "audio",
+                        sid,
+                    })
+                } else {
+                    Reply::err(ApiError::NoTrack { sid })
+                },
+            );
         }
         Verb::Sub { sid } => {
             let ok = handle_track(app, fr, &sid.to_string(), false);
-            answer(if ok {
-                Reply::ok(Outcome::TrackCommitted { track: "sub", sid })
-            } else {
-                Reply::err(ApiError::NoTrack { sid })
-            });
+            answer(
+                app,
+                if ok {
+                    Reply::ok(Outcome::TrackCommitted { track: "sub", sid })
+                } else {
+                    Reply::err(ApiError::NoTrack { sid })
+                },
+            );
         }
         Verb::Quality { rung } => {
             let ok = handle_quality(app, fr, &rung);
-            answer(if ok {
-                Reply::ok(Outcome::QualityCommitted { rung })
-            } else {
-                Reply::err(ApiError::UnknownRung { rung })
-            });
+            answer(
+                app,
+                if ok {
+                    Reply::ok(Outcome::QualityCommitted { rung })
+                } else {
+                    Reply::err(ApiError::UnknownRung { rung })
+                },
+            );
         }
         Verb::Profile { index } => {
             // Structured pre-checks the FIFO's token cannot express: the session machine
             // silently drops a pick made outside the roster phase — say so — and the
             // roster must have that index.
-            let (auth_phase, user_count) = {
+            let (auth_phase, user_count, uuid, epoch) = {
                 let bridge = app.runtime.bridge(&mut app.bridge);
-                let views = bridge.views();
-                (views.auth.0.phase, views.auth.0.users.len())
+                let auth = bridge.views().auth.0;
+                (
+                    auth.phase,
+                    auth.users.len(),
+                    auth.users.get(index).map(|user| user.uuid.clone()),
+                    auth.flow_epoch,
+                )
             };
-            if auth_phase != plx_session::auth::Phase::Profiles {
-                answer(Reply::err(ApiError::NotOnRoster {
-                    phase: format!("{auth_phase:?}").to_lowercase(),
-                }));
-            } else if index >= user_count {
-                answer(Reply::err(ApiError::NoProfile {
-                    index,
-                    count: user_count,
-                }));
-            } else {
+            if !matches!(
+                auth_phase,
+                plx_session::auth::Phase::Profiles | plx_session::auth::Phase::Switching
+            ) {
+                answer(
+                    app,
+                    Reply::err(ApiError::NotOnRoster {
+                        phase: format!("{auth_phase:?}").to_lowercase(),
+                    }),
+                );
+            } else if let (Some(uuid), Some(epoch)) = (uuid, epoch.checked_add(1)) {
                 commit_profile(app, index, None);
-                // Parked: the response is the SEATING — the flow reaching `ready` after
-                // this pick (with the profile's title) — or the flow's error line, or
-                // the flow moving on without the pick.
                 arm_awaiting(
+                    &mut app.api_waiting,
                     reply.clone(),
                     fr.now,
                     What::Profile {
                         index,
-                        from: auth_phase,
+                        uuid,
+                        epoch,
                         seen_switching: false,
                     },
+                );
+            } else if index >= user_count {
+                answer(
+                    app,
+                    Reply::err(ApiError::NoProfile {
+                        index,
+                        count: user_count,
+                    }),
+                );
+            } else {
+                answer(
+                    app,
+                    Reply::err(ApiError::Internal {
+                        reason: "profile epoch exhausted".into(),
+                    }),
                 );
             }
         }
@@ -574,6 +636,7 @@ pub(crate) unsafe fn execute_request(
             let play = matches!(req.verb, Verb::Resume);
             if handle_transport(app, fr, play) {
                 arm_awaiting(
+                    &mut app.api_waiting,
                     reply.clone(),
                     fr.now,
                     What::Transport {
@@ -582,25 +645,26 @@ pub(crate) unsafe fn execute_request(
                     },
                 );
             } else {
-                answer(no_engine);
+                answer(app, no_engine);
             }
         }
         Verb::Stop => {
             // Idempotent: an idle session has nothing to leave, and "stopped" is still
             // the true answer to "is it playing".
             handle_stop(app);
-            answer(Reply::ok(Outcome::Stopped));
+            answer(app, Reply::ok(Outcome::Stopped));
         }
         Verb::State => {
-            answer(Reply::ok(Outcome::State {
-                snapshot: snapshot(app, fr),
-            }));
+            let snapshot = snapshot(app, fr);
+            answer(app, Reply::ok(Outcome::State { snapshot }));
         }
         Verb::Shot => {
             // Parked: the response is the CAPTURE (the numbered PNG, written on the
             // frame swap after this one) or the capture's refusal — not this request.
-            crate::shot::request();
-            arm_awaiting(reply.clone(), fr.now, What::Shot);
+            app.pages
+                .present
+                .note(plx_machine::present::PresentEvent::Wake);
+            arm_awaiting(&mut app.api_waiting, reply.clone(), fr.now, What::Shot);
         }
     }
 }
@@ -680,7 +744,6 @@ fn handle_transport(app: &mut super::App, fr: &super::run::Frame, play: bool) ->
 }
 
 fn handle_stop(app: &mut super::App) -> bool {
-    drop_plays("superseded by a stop or a newer play");
     app.menu_play_await = None;
     if plx_media::player::state(&app.player.session) != plx_media::player::PlaybackState::Idle
         || super::bridge::player(&app.pages).is_some()
@@ -693,6 +756,11 @@ fn handle_stop(app: &mut super::App) -> bool {
             &mut app.pages,
         );
     }
+    drop_plays(
+        &mut app.api_waiting,
+        "superseded by a stop or a newer play",
+        plx_media::player::state(&app.player.session),
+    );
     true
 }
 
@@ -820,6 +888,14 @@ pub(super) unsafe fn publish(app: &mut super::App, now_ms: u32) {
     resolve_awaiting(app, st, now_ms);
 }
 
+fn track_ordinal(tracks: &[plx_data::metadata::Stream], index: usize, audio: bool) -> i32 {
+    if audio {
+        plx_data::metadata::audio_ordinal(tracks, index)
+    } else {
+        plx_data::metadata::sub_render_ordinal(tracks, index)
+    }
+}
+
 fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
     let st = plx_media::player::state(&app.player.session);
     let state_name = state_str(st);
@@ -862,7 +938,7 @@ fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
             .map(|(i, s)| {
                 let mut o = json!({
                     "sid": s.id,
-                    "ord": plx_data::metadata::audio_ordinal(list, i),
+                    "ord": track_ordinal(list, i, audio),
                     "codec": s.codec,
                     "lang": s.lang,
                     "title": s.title,
@@ -894,7 +970,7 @@ fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
         "playing": plx_media::player::is_playing(ps),
         // The viewer's pause — `true` while the transport is paused for the viewer (a claim
         // hold's own pause is NOT the viewer's and stays out of this lens).
-        "paused": plx_media::player::transport::viewer_paused(ps),
+        "paused": plx_media::player::transport::viewer_paused_for(ps, &app.adapters.player),
         "pos_ms": plx_media::player::playpos_ns(ps).unwrap_or(0) / 1_000_000,
         "dur_ms": plx_media::player::duration_ns(ps).unwrap_or(0) / 1_000_000,
         "title": now.map(|n| n.title.clone()).unwrap_or_default(),
@@ -920,6 +996,62 @@ fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_and_supersession_reply_with_the_state_at_completion() {
+        let mut waiting = VecDeque::new();
+        let (play, play_response) = socket::ReplyTo::test_channel(11);
+        let (shot, shot_response) = socket::ReplyTo::test_channel(12);
+        arm_awaiting(
+            &mut waiting,
+            play,
+            0,
+            What::Play {
+                rk: "movie".into(),
+                request: None,
+            },
+        );
+        arm_awaiting(&mut waiting, shot, 0, What::Shot);
+
+        assert!(!can_park(&waiting, &socket::Verb::Shot));
+        assert!(shot_pending(&waiting));
+        drop_plays(&mut waiting, "stopped", PlaybackState::Idle);
+        let (id, reply) = play_response.try_recv().unwrap();
+        assert_eq!(id, Some(11));
+        assert_eq!(reply.state, Some("idle"));
+        assert!(matches!(
+            reply.outcome,
+            Some(socket::Outcome::PlayFailed { .. })
+        ));
+
+        shot_completed(&mut waiting, Ok("shot.png".into()), PlaybackState::Playing);
+        let (id, reply) = shot_response.try_recv().unwrap();
+        assert_eq!(id, Some(12));
+        assert_eq!(reply.state, Some("playing"));
+        assert!(matches!(
+            reply.outcome,
+            Some(socket::Outcome::ShotCaptured { .. })
+        ));
+        assert!(!shot_pending(&waiting));
+    }
+
+    #[test]
+    fn snapshot_subtitle_ordinals_exclude_external_streams() {
+        let tracks = [
+            plx_data::metadata::Stream {
+                index: 0,
+                external: true,
+                ..Default::default()
+            },
+            plx_data::metadata::Stream {
+                index: 1,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(track_ordinal(&tracks, 0, false), -1);
+        assert_eq!(track_ordinal(&tracks, 1, false), 0);
+        assert_eq!(track_ordinal(&tracks, 1, true), 1);
+    }
 
     #[test]
     fn seek_target_must_fit_signed_nanoseconds() {

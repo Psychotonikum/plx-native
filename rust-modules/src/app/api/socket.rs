@@ -234,6 +234,12 @@ pub(super) struct ReplyTo {
 }
 
 impl ReplyTo {
+    #[cfg(test)]
+    pub(super) fn test_channel(id: u64) -> (Self, mpsc::Receiver<Response>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        (Self { id, sender }, receiver)
+    }
+
     pub(super) fn send(&self, reply: Reply) {
         if matches!(
             self.sender.try_send((Some(self.id), reply)),
@@ -360,24 +366,21 @@ fn serve(mut conn: UnixStream, mut enqueue: impl FnMut(Request) -> bool) {
     }
 }
 
+/// Parse the envelope first so malformed verbs retain a valid request ID.
 /// One line of the wire: a request object (`{"id": 42, "req": ...}`) or
 /// nothing. Returns the client's id and its verb when the line is a request
 /// object; a malformed line's reply is the protocol's only on-the-spot answer,
 /// and it names no id — there was none to echo.
-fn parse(line: &str) -> Option<(u64, Verb)> {
-    #[derive(Deserialize)]
-    struct Wire {
-        id: u64,
-        req: Verb,
-    }
-    serde_json::from_str::<Wire>(line)
-        .ok()
-        .map(|w| (w.id, w.req))
+fn parse(line: &str) -> Result<(u64, Verb), Option<u64>> {
+    let mut request: serde_json::Value = serde_json::from_str(line).map_err(|_| None)?;
+    let id = request["id"].as_u64().ok_or(None)?;
+    let verb = serde_json::from_value(request["req"].take()).map_err(|_| Some(id))?;
+    Ok((id, verb))
 }
 
 /// Post a well-formed request to the frame thread's input path (the response
 /// comes via [`reply`], later) or answer a protocol-level error immediately —
-/// a malformed line has no id to correlate with, and the frame thread should
+/// a malformed envelope may have no id to correlate with, and the frame thread should
 /// never parse it.
 fn handle_line(
     line: &str,
@@ -386,10 +389,10 @@ fn handle_line(
     enqueue: &mut impl FnMut(Request) -> bool,
 ) {
     let (id, verb) = match parse(line) {
-        Some(v) => v,
-        None => {
+        Ok(v) => v,
+        Err(id) => {
             pending.push_back((
-                None,
+                id,
                 Reply::err(ApiError::Malformed {
                     reason: "the line is not a request object".to_string(),
                 }),
@@ -515,7 +518,7 @@ mod tests {
             r#"{"id": 1, "req": {"kind": "play"}}"#,
             "{}",
         ] {
-            assert!(parse(bad).is_none(), "the door: {bad}");
+            assert!(parse(bad).is_err(), "the door: {bad}");
         }
     }
 
@@ -668,6 +671,21 @@ mod tests {
             },
             r#"{"id":null,"ok":false,"error":{"code":"malformed","reason":"x"}}"#
         );
+    }
+
+    #[test]
+    fn malformed_verb_keeps_a_valid_request_id() {
+        let (sender, _) = mpsc::sync_channel(1);
+        let mut pending = VecDeque::new();
+        handle_line(
+            r#"{"id":7,"req":{"kind":"explode"}}"#,
+            &sender,
+            &mut pending,
+            &mut |_| panic!("invalid verb reached the app"),
+        );
+        let (id, reply) = pending.pop_front().unwrap();
+        assert_eq!(id, Some(7));
+        assert!(matches!(reply.error, Some(ApiError::Malformed { .. })));
     }
 
     fn start_serve() -> (String, mpsc::Receiver<Request>) {

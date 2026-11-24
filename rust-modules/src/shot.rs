@@ -278,9 +278,9 @@ pub(crate) fn read_flipped(vx: c_int, vy: c_int, vw: c_int, vh: c_int, ch: usize
 /// without `atexit` teardown (`platform-desktop/src/bin/sim.rs`).
 
 #[must_use = "a headless one-shot capture asks the caller to end the run"]
-pub(crate) fn maybe_capture(now: u32, busy: bool, last_change_ms: u32, vx: c_int, vy: c_int, vw: c_int, vh: c_int, completed: impl FnOnce(Result<String, String>)) -> bool {
+pub(crate) fn maybe_capture(now: u32, busy: bool, last_change_ms: u32, vx: c_int, vy: c_int, vw: c_int, vh: c_int, api_shot: bool, completed: impl FnOnce(Result<String, String>)) -> bool {
     let n = FRAMES.fetch_add(1, Ordering::Relaxed);
-    let on_demand = ON_DEMAND.swap(false, Ordering::Relaxed);
+    let on_demand = ON_DEMAND.swap(false, Ordering::Relaxed) || api_shot;
     let requested = SETTLED.swap(false, Ordering::Relaxed);
     let cfg = cfg();
     let ready = cfg.settle.is_some_and(|settle| settled_due(settle, cfg.after,
