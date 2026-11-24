@@ -46,6 +46,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
@@ -312,6 +313,18 @@ fn bind_private(path: &std::path::Path) -> std::io::Result<UnixListener> {
     listener
 }
 
+// A peer can close its writing half and still be able to receive replies.
+fn peer_disconnected(conn: &UnixStream) -> bool {
+    let mut fd = libc::pollfd {
+        fd: conn.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: fd is live through conn, and poll reads/writes exactly one pollfd.
+    (unsafe { libc::poll(&mut fd, 1, 0) }) > 0
+        && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
 /// Serve one connection: read request lines, write responses. Runs until the client
 /// closes, or a write to it times out (a client that cannot drain its buffer in a second
 /// is gone; the next connect gets a fresh channel).
@@ -319,6 +332,7 @@ fn serve(mut conn: UnixStream, mut enqueue: impl FnMut(Request) -> bool) {
     let _ = conn.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = conn.set_write_timeout(Some(Duration::from_secs(1)));
     let (sender, responses) = mpsc::sync_channel(256);
+    let mut sender = Some(sender);
     let mut line = Vec::new();
     let mut pending = VecDeque::new();
     loop {
@@ -333,9 +347,20 @@ fn serve(mut conn: UnixStream, mut enqueue: impl FnMut(Request) -> bool) {
                 return;
             }
         }
+        let Some(tx) = sender.as_ref() else {
+            if peer_disconnected(&conn) {
+                return;
+            }
+            match responses.recv_timeout(Duration::from_millis(100)) {
+                Ok(reply) => pending.push_back(reply),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            continue;
+        };
         let mut buf = [0u8; 4096];
         match conn.read(&mut buf) {
-            Ok(0) => return,
+            Ok(0) => sender = None,
             Ok(n) => {
                 for chunk in buf[..n].split_inclusive(|byte| *byte == b'\n') {
                     if line.len() + chunk.len() > 64 * 1024 {
@@ -345,10 +370,10 @@ fn serve(mut conn: UnixStream, mut enqueue: impl FnMut(Request) -> bool) {
                     if chunk.ends_with(b"\n") {
                         if let Some(text) = std::str::from_utf8(&line).ok().map(str::trim) {
                             if !text.is_empty() {
-                                handle_line(text, &sender, &mut pending, &mut enqueue);
+                                handle_line(text, tx, &mut pending, &mut enqueue);
                             }
                         } else {
-                            handle_line("", &sender, &mut pending, &mut enqueue);
+                            handle_line("", tx, &mut pending, &mut enqueue);
                         }
                         line.clear();
                     }
@@ -505,7 +530,7 @@ mod tests {
             (r#"{"id": 11, "req": {"kind": "shot"}}"#, 11, Verb::Shot),
         ];
         for (line, want_id, want) in cases {
-            let (id, got) = parse(line).unwrap_or_else(|| panic!("parse: {line}"));
+            let (id, got) = parse(line).unwrap_or_else(|_| panic!("parse: {line}"));
             assert_eq!(id, want_id, "the id for {line}");
             assert_eq!(verb(&got), verb(&want), "the verb for {line}");
         }
@@ -753,6 +778,27 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["outcome"]["kind"], "state");
         assert_eq!(v["outcome"]["snapshot"]["pos_ms"], 354_000);
+    }
+
+    #[test]
+    fn a_client_can_close_its_writing_half_and_still_read_an_outcome() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (send, requests) = mpsc::channel();
+        let handler =
+            std::thread::spawn(move || serve(server, |request| send.send(request).is_ok()));
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"{\"id\":17,\"req\":{\"kind\":\"stop\"}}\n")
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        request.reply.send(Reply::ok(Outcome::Stopped));
+        drop(request);
+        assert!(read_line(&client).contains("\"kind\":\"stopped\""));
+        assert!(read_line(&client).is_empty());
+        handler.join().unwrap();
     }
 
     #[test]

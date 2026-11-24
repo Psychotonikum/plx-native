@@ -30,7 +30,7 @@ enum What {
     Seek {
         ms: u64,
         generation: u32,
-        seen_seeking: bool,
+        operation: SeekOperation,
     },
     Transport {
         play: bool,
@@ -45,13 +45,58 @@ enum What {
     Profile {
         index: usize,
         uuid: String,
-        epoch: u64,
+        correlation: u32,
+        epoch: Option<u64>,
         seen_switching: bool,
     },
     /// `shot` — answers `shot_captured` when the numbered PNG is written (shot.rs) or
     /// `shot_failed` when the capture fails or on the deadline.
     Shot,
 }
+enum SeekOperation {
+    Feed(u32),
+    Uri {
+        attempt: plx_playback_contract::AttemptId,
+        command: plx_playback_contract::CommandId,
+    },
+}
+
+impl SeekOperation {
+    fn submitted(
+        ps: &plx_media::route::PlaybackSession,
+        player: &plx_media::player::adapter::PlayerAdapter,
+    ) -> Option<Self> {
+        if ps.attempt_view().backend() == Some(plx_media::player::attempt_view::Backend::Uri) {
+            let snapshot = player.backend_snapshot();
+            Some(Self::Uri {
+                attempt: snapshot.attempt?,
+                command: snapshot.last_queued?,
+            })
+        } else {
+            Some(Self::Feed(ps.readout().seek_epoch()))
+        }
+    }
+
+    /// None means this operation still owes a landing; false means it was retired.
+    fn settled(
+        &self,
+        ps: &plx_media::route::PlaybackSession,
+        uri: &plx_playback_contract::Snapshot,
+    ) -> Option<bool> {
+        match *self {
+            Self::Feed(epoch) if ps.readout().seek_epoch() != epoch => Some(false),
+            Self::Feed(epoch) if ps.readout().raw().seek_landed_epoch == epoch => Some(true),
+            Self::Feed(_) => (!ps.readout().seeking()).then_some(false),
+            Self::Uri { attempt, .. } if uri.attempt != Some(attempt) => Some(false),
+            Self::Uri { command, .. } if uri.seek_landed == Some(command) => Some(true),
+            Self::Uri { command, .. } => uri
+                .seek_landed
+                .filter(|landed| *landed > command)
+                .map(|_| false),
+        }
+    }
+}
+
 /// One parked typed request: the id its answer must echo, and the instant it parked.
 pub(super) struct InFlight {
     reply: socket::ReplyTo,
@@ -75,6 +120,7 @@ fn can_park(waiting: &VecDeque<InFlight>, verb: &socket::Verb) -> bool {
             matches!(
                 (verb, &entry.what),
                 (socket::Verb::Profile { .. }, What::Profile { .. })
+                    | (socket::Verb::Seek { .. }, What::Seek { .. })
                     | (socket::Verb::Shot, What::Shot)
             )
         })
@@ -159,6 +205,7 @@ unsafe fn resolve_awaiting(
     st: plx_media::player::PlaybackState,
     now_ms: u32,
 ) {
+    let admission = app.bridge.take_api_profile_admission();
     let guard = &mut app.api_waiting;
     if guard.is_empty() {
         return;
@@ -220,37 +267,32 @@ unsafe fn resolve_awaiting(
             What::Seek {
                 ms,
                 generation,
-                seen_seeking,
+                operation,
             } => {
-                // The engine's own `seeking` state gates the landing: `request_seek` leaves
-                // the engine in `seeking` (observable on the frame it runs), so the 3 s
-                // position window alone — which could already hold for the target BEFORE any
-                // seek runs — answers only for a seek that actually ran and then settled.
-                *seen_seeking |= st == plx_media::player::PlaybackState::Seeking;
-                if !is_seated(st) || *generation != plx_media::route::playback_trace_generation() {
-                    Some(socket::Reply::ok(socket::Outcome::SeekFailed {
+                let outcome = if !is_seated(st)
+                    || *generation != plx_media::route::playback_trace_generation()
+                {
+                    Some(socket::Outcome::SeekFailed {
                         ms: *ms,
                         reason: format!("the session left playback (state {state_name})"),
-                    }))
-                } else if st != plx_media::player::PlaybackState::Seeking
-                    && seek_landed(*seen_seeking, pos_ms, *ms)
+                    })
+                } else if let Some(landed) =
+                    operation.settled(ps, app.adapters.player.backend_snapshot())
                 {
-                    Some(socket::Reply::ok(socket::Outcome::SeekLanded {
-                        ms: *ms,
-                        pos_ms,
-                    }))
-                } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_SEEK_SECS * 1_000 {
-                    Some(socket::Reply::ok(
-                        socket::Outcome::SeekFailed {
+                    if landed {
+                        Some(socket::Outcome::SeekLanded { ms: *ms, pos_ms })
+                    } else {
+                        Some(socket::Outcome::SeekFailed {
                             ms: *ms,
-                            reason: format!(
-                                "no landing within {AWAIT_SEEK_SECS} s (state {state_name}, pos {pos_ms} ms)"
-                            ),
-                        },
-                    ))
+                            reason: "the seek was retired before landing".into(),
+                        })
+                    }
+                } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_SEEK_SECS * 1_000 {
+                    Some(socket::Outcome::SeekFailed { ms: *ms, reason: format!("no landing within {AWAIT_SEEK_SECS} s (state {state_name}, pos {pos_ms} ms)") })
                 } else {
                     None
-                }
+                };
+                outcome.map(socket::Reply::ok)
             }
             What::Transport { play, generation } => {
                 use plx_media::player::PlaybackState;
@@ -273,70 +315,85 @@ unsafe fn resolve_awaiting(
             What::Profile {
                 index,
                 uuid,
+                correlation,
                 epoch,
                 seen_switching,
             } => {
-                *seen_switching |=
-                    auth.flow_epoch == *epoch && auth.phase == plx_session::auth::Phase::Switching;
-                if auth.flow_epoch > *epoch {
+                if let Some((_, accepted_epoch)) = admission.filter(|(id, _)| id == correlation) {
+                    if accepted_epoch.is_none() {
+                        f.reply.send(
+                            socket::Reply::ok(socket::Outcome::ProfileFailed {
+                                index: *index,
+                                reason: "the session refused the selection".into(),
+                            })
+                            .with_state(state_name),
+                        );
+                        continue;
+                    }
+                    *epoch = accepted_epoch;
+                }
+                if now_ms.wrapping_sub(f.since_ms) >= AWAIT_PROFILE_SECS * 1_000 {
                     Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
                         index: *index,
-                        reason: "superseded by another session command".into(),
+                        reason: format!("the switch did not land within {AWAIT_PROFILE_SECS} s"),
                     }))
-                } else if auth.flow_epoch == *epoch && auth.phase == plx_session::auth::Phase::Ready
-                {
-                    let outcome = match auth.profile.as_ref().filter(|p| p.uuid == *uuid) {
-                        Some(profile) => socket::Outcome::ProfileSeated {
+                } else if let Some(epoch) = *epoch {
+                    *seen_switching |= auth.flow_epoch == epoch
+                        && auth.phase == plx_session::auth::Phase::Switching;
+                    if auth.flow_epoch > epoch {
+                        Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
                             index: *index,
-                            title: profile.title.clone(),
-                        },
-                        None => socket::Outcome::ProfileFailed {
+                            reason: "superseded by another session command".into(),
+                        }))
+                    } else if auth.flow_epoch == epoch
+                        && auth.phase == plx_session::auth::Phase::Ready
+                    {
+                        let outcome = match auth.profile.as_ref().filter(|p| p.uuid == *uuid) {
+                            Some(profile) => socket::Outcome::ProfileSeated {
+                                index: *index,
+                                title: profile.title.clone(),
+                            },
+                            None => socket::Outcome::ProfileFailed {
+                                index: *index,
+                                reason: "the selected profile did not seat".into(),
+                            },
+                        };
+                        Some(socket::Reply::ok(outcome))
+                    } else if auth.flow_epoch == epoch
+                        && auth.phase == plx_session::auth::Phase::Error
+                    {
+                        Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
                             index: *index,
-                            reason: "the selected profile did not seat".into(),
-                        },
-                    };
-                    Some(socket::Reply::ok(outcome))
-                } else if auth.flow_epoch == *epoch && auth.phase == plx_session::auth::Phase::Error
-                {
-                    Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
-                        index: *index,
-                        reason: if auth.error.is_empty() {
-                            "the flow reported an error".to_string()
-                        } else {
-                            auth.error.to_string()
-                        },
-                    }))
-                } else if *seen_switching && auth.phase == plx_session::auth::Phase::Profiles {
-                    // The switch began, then went back to the roster without seating (a
-                    // denied PIN, a cancel): this pick is dead.
-                    Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
-                        index: *index,
-                        reason: "the flow returned to the roster without seating".to_string(),
-                    }))
-                } else if auth.flow_epoch == *epoch
-                    && !matches!(
-                        auth.phase,
-                        plx_session::auth::Phase::Profiles | plx_session::auth::Phase::Switching
-                    )
-                {
-                    // Any other phase (idle, a re-sign-in in flight, erased local state)
-                    // is the flow leaving the switch without this pick.
-                    Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
-                        index: *index,
-                        reason: format!("the flow left the switch (phase {:?})", auth.phase)
-                            .to_lowercase(),
-                    }))
-                } else if now_ms.wrapping_sub(f.since_ms) >= AWAIT_PROFILE_SECS * 1_000 {
-                    // Still on the roster or still switching after the horizon: the
-                    // switch will not land.
-                    Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
-                        index: *index,
-                        reason: format!(
-                            "the switch did not land within {AWAIT_PROFILE_SECS} s (now {:?})",
-                            auth.phase
+                            reason: if auth.error.is_empty() {
+                                "the flow reported an error".to_string()
+                            } else {
+                                auth.error.to_string()
+                            },
+                        }))
+                    } else if *seen_switching && auth.phase == plx_session::auth::Phase::Profiles {
+                        // The switch began, then went back to the roster without seating (a
+                        // denied PIN, a cancel): this pick is dead.
+                        Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
+                            index: *index,
+                            reason: "the flow returned to the roster without seating".to_string(),
+                        }))
+                    } else if auth.flow_epoch == epoch
+                        && !matches!(
+                            auth.phase,
+                            plx_session::auth::Phase::Profiles
+                                | plx_session::auth::Phase::Switching
                         )
-                        .to_lowercase(),
-                    }))
+                    {
+                        // Any other phase (idle, a re-sign-in in flight, erased local state)
+                        // is the flow leaving the switch without this pick.
+                        Some(socket::Reply::ok(socket::Outcome::ProfileFailed {
+                            index: *index,
+                            reason: format!("the flow left the switch (phase {:?})", auth.phase)
+                                .to_lowercase(),
+                        }))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -394,7 +451,7 @@ pub(super) fn reject_during_replay(req: socket::Request) {
 
 fn state_file(app: &mut super::App, fr: &super::run::Frame) {
     let json = snapshot(app, fr).to_string();
-    let path = plx_base::paths::in_runtime_dir("state.json");
+    let path = plx_base::paths::in_runtime_dir(plx_base::paths::runtime_file::CONTROL_STATE);
     if plx_base::storage_worker::submit(move || {
         if let Err(error) = plx_plex::plex::session::write_atomic(&path, json.as_bytes()) {
             log(&format!(
@@ -436,7 +493,7 @@ pub(crate) unsafe fn handle(
         },
         "audio" => handle_track(app, fr, arg, true),
         "sub" => handle_track(app, fr, arg, false),
-        "quality" => handle_quality(app, fr, arg),
+        "quality" => handle_quality(app, arg).is_ok(),
         "profile" => handle_profile(app, fr, arg),
         _ => false,
     }
@@ -510,26 +567,29 @@ pub(crate) unsafe fn execute_request(
                         .player
                         .request_seek(&mut app.player.session, ns)
                     {
-                        arm_awaiting(
-                            &mut app.api_waiting,
-                            reply.clone(),
-                            fr.now,
-                            What::Seek {
-                                ms,
-                                generation: plx_media::route::playback_trace_generation(),
-                                seen_seeking: plx_media::player::state(&app.player.session)
-                                    == plx_media::player::PlaybackState::Seeking,
-                            },
-                        );
-                    } else {
-                        answer(
-                            app,
-                            Reply::ok(Outcome::SeekFailed {
-                                ms,
-                                reason: "seek was refused".into(),
-                            }),
-                        );
+                        if let Some(operation) =
+                            SeekOperation::submitted(&app.player.session, &app.adapters.player)
+                        {
+                            arm_awaiting(
+                                &mut app.api_waiting,
+                                reply.clone(),
+                                fr.now,
+                                What::Seek {
+                                    ms,
+                                    generation: plx_media::route::playback_trace_generation(),
+                                    operation,
+                                },
+                            );
+                            return;
+                        }
                     }
+                    answer(
+                        app,
+                        Reply::ok(Outcome::SeekFailed {
+                            ms,
+                            reason: "seek was refused or could not be tracked".into(),
+                        }),
+                    );
                 } else {
                     answer(
                         app,
@@ -568,13 +628,12 @@ pub(crate) unsafe fn execute_request(
             );
         }
         Verb::Quality { rung } => {
-            let ok = handle_quality(app, fr, &rung);
+            let result = handle_quality(app, &rung);
             answer(
                 app,
-                if ok {
-                    Reply::ok(Outcome::QualityCommitted { rung })
-                } else {
-                    Reply::err(ApiError::UnknownRung { rung })
+                match result {
+                    Ok(()) => Reply::ok(Outcome::QualityCommitted { rung }),
+                    Err(error) => Reply::err(error),
                 },
             );
         }
@@ -582,14 +641,13 @@ pub(crate) unsafe fn execute_request(
             // Structured pre-checks the FIFO's token cannot express: the session machine
             // silently drops a pick made outside the roster phase — say so — and the
             // roster must have that index.
-            let (auth_phase, user_count, uuid, epoch) = {
+            let (auth_phase, user_count, uuid) = {
                 let bridge = app.runtime.bridge(&mut app.bridge);
                 let auth = bridge.views().auth.0;
                 (
                     auth.phase,
                     auth.users.len(),
                     auth.users.get(index).map(|user| user.uuid.clone()),
-                    auth.flow_epoch,
                 )
             };
             if !matches!(
@@ -602,8 +660,16 @@ pub(crate) unsafe fn execute_request(
                         phase: format!("{auth_phase:?}").to_lowercase(),
                     }),
                 );
-            } else if let (Some(uuid), Some(epoch)) = (uuid, epoch.checked_add(1)) {
-                commit_profile(app, index, None);
+            } else if let Some(uuid) = uuid {
+                let target = app.bridge.api_profile_reply_to();
+                super::bridge::execute_session_command(
+                    &mut app.pages,
+                    plx_session::auth::SessionCmd::SelectProfileWithReply {
+                        index,
+                        pin: None,
+                        reply: target,
+                    },
+                );
                 arm_awaiting(
                     &mut app.api_waiting,
                     reply.clone(),
@@ -611,11 +677,12 @@ pub(crate) unsafe fn execute_request(
                     What::Profile {
                         index,
                         uuid,
-                        epoch,
+                        correlation: target.correlation,
+                        epoch: None,
                         seen_switching: false,
                     },
                 );
-            } else if index >= user_count {
+            } else {
                 answer(
                     app,
                     Reply::err(ApiError::NoProfile {
@@ -623,15 +690,9 @@ pub(crate) unsafe fn execute_request(
                         count: user_count,
                     }),
                 );
-            } else {
-                answer(
-                    app,
-                    Reply::err(ApiError::Internal {
-                        reason: "profile epoch exhausted".into(),
-                    }),
-                );
             }
         }
+
         Verb::Pause | Verb::Resume => {
             let play = matches!(req.verb, Verb::Resume);
             if handle_transport(app, fr, play) {
@@ -700,15 +761,6 @@ fn is_seated(st: plx_media::player::PlaybackState) -> bool {
 
 fn seek_ns(ms: u64) -> Option<i64> {
     i64::try_from(ms).ok()?.checked_mul(1_000_000)
-}
-
-/// The `seek_landed` gate: the engine must have actually sought (`seen_seeking` — it
-/// passes through `seeking` on the frame `request_seek` runs) AND the position must
-/// have settled within 3 s of the target. The position window alone answered a no-op
-/// seek on the very next frame, because the target can sit inside the window before
-/// any seek runs.
-fn seek_landed(seen_seeking: bool, pos_ms: i64, ms: u64) -> bool {
-    seen_seeking && pos_ms.abs_diff(ms as i64) <= 3_000
 }
 
 unsafe fn handle_play(app: &mut super::App, fr: &super::run::Frame, rk: &str) -> bool {
@@ -782,71 +834,65 @@ unsafe fn handle_track(
     let Some(item) = views.metadata.playing() else {
         return false;
     };
-    if audio {
-        let Some(i) = item.audio.iter().position(|s| s.id == sid) else {
+    use plx_appkit::track_menu::TrackCommit;
+    let commit = if audio {
+        let Some(i) = item.audio.iter().position(|stream| stream.id == sid) else {
             return false;
         };
-        let ord = plx_data::metadata::audio_ordinal(&item.audio, i);
-        plx_media::route::commit_audio_selection(
-            &mut app.player.session,
-            plx_media::route::CarriedAudio::from_stream(&item.audio[i], ord),
-        )
+        let ordinal = plx_data::metadata::audio_ordinal(&item.audio, i);
+        TrackCommit::Audio {
+            carried: plx_media::route::CarriedAudio::from_stream(&item.audio[i], ordinal),
+            memo: None,
+        }
+    } else if sid == 0 {
+        TrackCommit::Subtitle {
+            render_ordinal: -1,
+            stream_id: 0,
+            sidecar_key: None,
+            sidecar_codec: String::new(),
+            memo: None,
+        }
     } else {
-        let Some(i) = item.subs.iter().position(|s| s.id == sid) else {
+        let Some(i) = item.subs.iter().position(|stream| stream.id == sid) else {
             return false;
         };
-        let s = &item.subs[i];
-        // The track menu's own commit, field for field: the DEMUXER ordinal (the client
-        // renderer's input — −1 for an external pick, which the embedded renderer cannot
-        // draw), the sidecar the stream names (key + codec — the external pick
-        // `player::sidecar` fetches and draws), and no viewer memo (an agent's pick
-        // remembers nothing, the ladder's raw commit path).
-        let ridx = plx_data::metadata::sub_render_ordinal(&item.subs, i);
-        let sidecar = s
-            .sidecar_renderable()
-            .then(|| (s.key.clone(), s.codec.clone()));
-        // The commit itself is infallible (its own docs): the pick is validated above —
-        // the sid is one of the seated item's sub rows, so the ordinal is in range — and
-        // the sidecar is fetched by `player::sidecar` when the stream loads. So `true`
-        // here is the truthful report: "committed", not "confirmed on screen".
-        plx_media::route::commit_subtitle_and_sidecar(
-            &mut app.player.session,
-            ridx,
-            s.id,
-            sidecar.as_ref().map(|(k, _)| k.clone()),
-            sidecar.map(|(_, c)| c).unwrap_or_default(),
-            None,
-        );
-        true
-    }
+        let stream = &item.subs[i];
+        TrackCommit::Subtitle {
+            render_ordinal: plx_data::metadata::sub_render_ordinal(&item.subs, i),
+            stream_id: sid,
+            sidecar_key: stream.sidecar_renderable().then(|| stream.key.clone()),
+            sidecar_codec: stream.codec.clone(),
+            memo: None,
+        }
+    };
+    let mut bridge = bridge;
+    super::playback::commit_track(
+        &mut app.player.session,
+        &mut app.adapters.player,
+        bridge.metadata_mut(),
+        commit,
+    )
 }
 
-/// `api:quality:<rung>` — the \u2026 menu\u2019s own quality commit, performed through the menu\u2019s own
-/// function: `apply_more_action` re-asks the routing question for the stream on screen and
-/// reloads only if the answer changed (the live switch while the engine runs); a terminal
-/// engine gets the persist-then-fresh-retry path instead — the failure screen\u2019s Retry at the
-/// new rung.
-unsafe fn handle_quality(
-    app: &mut crate::app::App,
-    _fr: &mut crate::app::run::Frame,
-    arg: &str,
-) -> bool {
-    let Ok(q) = serde_json::from_value::<plx_media::route::Quality>(serde_json::Value::String(
-        arg.to_string(),
-    )) else {
-        log(&format!("api: quality: unknown rung {arg}"));
-        return false;
-    };
+fn handle_quality(app: &mut super::App, arg: &str) -> Result<(), socket::ApiError> {
+    let quality =
+        serde_json::from_value(serde_json::Value::String(arg.to_owned())).map_err(|_| {
+            socket::ApiError::UnknownRung {
+                rung: arg.to_owned(),
+            }
+        })?;
     let mut bridge = app.runtime.bridge(&mut app.bridge);
-    crate::app::playback::apply_more_action(
+    super::playback::apply_quality(
         &mut app.player.session,
         &mut app.adapters.player,
         &mut bridge,
-        plx_appkit::more_menu::Action::SetQuality(q),
+        quality,
         &mut app.pages.present,
-    );
-    log(&format!("api: quality: rung set to {arg}"));
-    true
+    )
+    .then_some(())
+    .ok_or_else(|| socket::ApiError::Internal {
+        reason: "the player refused the quality change".into(),
+    })
 }
 
 /// `api:profile:<index>[:<pin>|-]` — commit a roster pick through the session machine\u2019s own
@@ -1058,23 +1104,5 @@ mod tests {
         assert_eq!(seek_ns(123), Some(123_000_000));
         assert_eq!(seek_ns(u64::MAX), None);
         assert_eq!(seek_ns(i64::MAX as u64), None);
-    }
-
-    /// The `seek_landed` gate: the 3 s position window alone could ALREADY hold for the
-    /// target before any seek runs (a target within 3 s of the current position), so a
-    /// landing additionally requires the engine to have actually passed through
-    /// `seeking`.
-    #[test]
-    fn seek_landed_requires_a_real_seek() {
-        // Inside the window, but no seek ran: not a landing.
-        assert!(!seek_landed(false, 1_000, 1_000));
-        assert!(!seek_landed(false, 2_900, 0));
-        // The seek ran and the position settled inside the window: a landing.
-        assert!(seek_landed(true, 2_900, 0));
-        assert!(seek_landed(true, 0, 2_900));
-        assert!(seek_landed(true, 3_000, 0));
-        // The seek ran but the position has not settled inside the window yet.
-        assert!(!seek_landed(true, 3_001, 0));
-        assert!(!seek_landed(true, 0, 3_001));
     }
 }
