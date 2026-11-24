@@ -878,7 +878,7 @@ unsafe fn present_and_swap(app: &mut App, fr: &mut Frame, pace: Option<u64>) {
         // A finished underlay-field reduction is read HERE, before framebuffer 0 holds anything
         // of this frame — a read between the page and the surfaces splits its render pass.
         plx_gfx::gfx::field_frame_begin();
-        #[cfg(feature = "sim")]
+        #[cfg(any(feature = "sim", feature = "devtriggers"))]
         let shot_last_change = app.pages.present.last_change_ms();
         let (_vx, _vy, _vw, _vh) = draw(app, fr);
         app.runtime.bridge(&mut app.bridge).observe_plex_visual_inputs(&mut app.pages.present);
@@ -925,14 +925,27 @@ unsafe fn present_and_swap(app: &mut App, fr: &mut Frame, pace: Option<u64>) {
         }
         #[cfg(all(feature = "sim", feature = "devtriggers"))]
         let screenshot_seam = !dumping;
-        #[cfg(all(feature = "sim", not(feature = "devtriggers")))]
+        #[cfg(any(all(feature = "sim", not(feature = "devtriggers")), all(not(feature = "sim"), feature = "devtriggers")))]
         let screenshot_seam = true;
         #[cfg(feature = "sim")]
+        let scenarios_pending = app.scenarios.shots.pending();
+        #[cfg(all(not(feature = "sim"), feature = "devtriggers"))]
+        let scenarios_pending = false;
+        #[cfg(any(feature = "sim", feature = "devtriggers"))]
         if screenshot_seam && crate::shot::maybe_capture(fr.now, app.pages.present.changed_after_admission()
             || app.pages.budget.has_queued_work() || plx_gfx::gfx::snapshot_pending()
-            || app.scenarios.shots.pending(), shot_last_change, _vx, _vy, _vw, _vh) {
+            || scenarios_pending, shot_last_change, _vx, _vy, _vw, _vh,
+            |result| {
+                #[cfg(feature = "devtriggers")]
+                super::api::shot_completed(result);
+                #[cfg(not(feature = "devtriggers"))]
+                drop(result);
+            }) {
             // The headless one-shot is done: finish this frame, then leave through the ordinary
             // shutdown rather than exiting from inside the frame (see `shot::maybe_capture`).
+            // The television never arms the one-shot (no PLXNATIVE_SHOT_EXIT), so this only
+            // ever fires in hostsim — but the statement itself is not cfg-gated (attributes on
+            // expressions are not stable), it is simply dead on the television.
             app.running = false;
         }
         {
@@ -1019,6 +1032,14 @@ pub(crate) unsafe fn ingest(app: &mut App, fr: &mut Frame) {
             let ok = !supplied && ingress_token(app, fr, &command.token);
             crate::lab::command_done(command.id, ok);
         }
+        #[cfg(feature = "devtriggers")]
+        for request in super::api::take_pending() {
+            if supplied {
+                super::api::reject_during_replay(request);
+            } else {
+                super::api::execute_request(app, fr, request);
+            }
+        }
         // The FIFO's tokens are collected first so the recorder (a field beside `remote`) can
         // be written per token. Where a token is recorded depends on what it is: a token that
         // pushes SDL events (a key, a click) is recorded where those are polled; a DIRECT one
@@ -1065,6 +1086,16 @@ unsafe fn ingress_token(app: &mut App, fr: &mut Frame, token: &str) -> bool {
         app.rec.input(super::recorder::enc_token(token));
         probe.run();
         return true;
+    }
+    // The command API's own verbs (`api:play` / `api:seek` / `api:audio` / `api:sub`) need
+    // the whole App and drive no SDL: they perform here, where the `&mut` is.
+    #[cfg(feature = "devtriggers")]
+    if token == "state" {
+        return super::api::handle(app, fr, "state");
+    }
+    #[cfg(feature = "devtriggers")]
+    if let Some(spec) = token.strip_prefix("api:") {
+        return super::api::handle(app, fr, spec);
     }
     // Keys and clicks use SDL's existing synthesis while coexistence lasts. Consume those
     // before a following direct text token, rather than moving all text ahead of all keys.
@@ -3031,8 +3062,16 @@ pub(crate) unsafe fn update(app: &mut App, fr: &mut Frame) {
         super::deeplink::frame(&mut app.pages, &mut app.deeplink, &mut app.menu_play_await,
             app.window_activity.allow_present(true), stands, fr.now);
         if app.menu_play_await.is_some() {
+            #[cfg(feature = "devtriggers")]
+            let api_wait = app.menu_play_await.as_ref().is_some_and(super::input::MenuPlayAwait::is_api);
+            #[cfg(feature = "devtriggers")]
+            let generation_before = plx_media::route::playback_trace_generation();
             menu_play_tick(&mut app.player.session, &mut app.adapters.player,
                 &mut app.pages, &mut app.runtime.bridge(&mut app.bridge), &mut app.menu_play_await, fr.now);
+            #[cfg(feature = "devtriggers")]
+            if api_wait && app.menu_play_await.is_none() {
+                super::api::play_wait_finished(generation_before);
+            }
         }
         // Server-side view-state WRITES (Mark as Watched / Unwatched, Remove from Deck): send
         // the next queued one, land the last one's answer and kick the refresh it owes. Route-
@@ -3446,6 +3485,11 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
     // answers; it requests no frame and reports nothing to the idle gate.
     #[cfg(feature = "devtriggers")]
     super::a11y_state::serve(app);
+    // The command API's read half: republish this frame's snapshot for the `state` door
+    // (api.rs — frame thread builds the string, the API thread only serves it). The door is
+    // devtrig-only, so is this line: a non-devtriggers build builds no snapshot at all.
+    #[cfg(feature = "devtriggers")]
+    super::api::publish(app);
         // dev: the stress-bench oscillators' own frame-time accumulator — right after Swap is
         // stamped (`present_and_swap`, just above this call in `run()`), the earliest point this
         // iteration's total is known. See `crate::dev::scenarios::bench_frame_tick`'s doc.

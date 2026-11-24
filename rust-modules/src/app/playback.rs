@@ -840,7 +840,7 @@ pub(crate) fn player_requests(
             }
             // The fall-through a surface cannot perform (`screens::player::overlay`'s module doc):
             // the same toggle the bare transport reaches, with the panel left untouched.
-            PlayerReq::Transport(play) => apply_transport(&mut player.session, pa, play, now, pages),
+            PlayerReq::Transport(play) => { apply_transport(&mut player.session, pa, play, now, pages); }
             PlayerReq::SeekTo(ns) => apply_seek_to(&mut player.session, pa, ns),
             // …and its twin, which does NOT resume: the scrub bar is how a paused film is moved.
             // The pump keeps the pause across it (see `commit_seek`).
@@ -1460,17 +1460,18 @@ pub(crate) fn perform_hud_command(
 /// Perform a [`PlayerReq::Transport`](plx_screens::registry::PlayerReq::Transport): the play/pause toggle (or a one-way PLAY or PAUSE), then keep the
 /// transport up. The one path the keys, OK on the picture, a panel's fall-through and the
 /// `toggle_play` command share.
-fn apply_transport(
+pub(super) fn apply_transport(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     play: Option<bool>,
     now: u32,
     pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
-) {
+) -> bool {
     let target = super::lifecycle::transport_target(play, super::lifecycle::viewer_paused_for(ps, pa));
-    set_transport_paused(ps, pa, target);
+    let accepted = set_transport_paused(ps, pa, target);
     super::bridge::send_player_message(pages,
         plx_screens::registry::AppMsg::PlayerExtendHud { now, duration_ms: HUD_LINGER_MS });
+    accepted
 }
 
 /// Perform a [`PlayerReq::SeekTo`](plx_screens::registry::PlayerReq::SeekTo): seek, and resume a paused film.
