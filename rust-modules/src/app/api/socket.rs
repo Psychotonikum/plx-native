@@ -111,8 +111,7 @@ pub enum Outcome {
         rk: String,
         reason: String,
     },
-    /// seek: the engine landed; `pos_ms` is the position it settled at (within 3 s of
-    /// the target — the engine's landing, not an echo of the request).
+    /// The backend acknowledged this seek; pos_ms is its observed playback position.
     SeekLanded {
         ms: u64,
         pos_ms: i64,
