@@ -162,7 +162,7 @@ pub(super) fn apply_quality(
             present.note_in_scope(plx_machine::present::Scope::Page, plx_machine::present::PresentEvent::Damage(plx_machine::present::Provenance::Input));
         }
     } else {
-        plx_media::route::set_quality(ps, quality);
+        return plx_media::route::set_quality(ps, quality);
     }
     true
 }

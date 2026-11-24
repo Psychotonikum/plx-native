@@ -4,6 +4,7 @@
 mod socket;
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::json;
@@ -18,15 +19,12 @@ static PENDING: Mutex<VecDeque<socket::Request>> = Mutex::new(VecDeque::new());
 enum What {
     /// `play:<rk>` — answers `play_started` (with the title) on the first frame that
     /// reaches `playing`; `play_failed` on the engine's verdict, a supersession, a
-    /// staging failure, or the deadline.
+    /// metadata refusal, or the deadline.
     Play {
         rk: String,
         request: Option<LogicalRequestId>,
     },
-    /// `seek:<ms>` — answers `seek_landed` once the engine has ACTUALLY sought
-    /// (`seen_seeking` — it enters `seeking` on the frame `request_seek` runs) AND the
-    /// position settles within 3 s of the target; `seek_failed` when the session leaves
-    /// playback or on the deadline.
+    /// Wait for the exact addressed seek to land or be retired.
     Seek {
         ms: u64,
         generation: u32,
@@ -319,7 +317,7 @@ unsafe fn resolve_awaiting(
                 epoch,
                 seen_switching,
             } => {
-                if let Some((_, accepted_epoch)) = admission.filter(|(id, _)| id == correlation) {
+                if let Some(accepted_epoch) = profile_epoch(*correlation, admission) {
                     if accepted_epoch.is_none() {
                         f.reply.send(
                             socket::Reply::ok(socket::Outcome::ProfileFailed {
@@ -418,6 +416,12 @@ unsafe fn resolve_awaiting(
     }
     *guard = keep;
 }
+fn profile_epoch(correlation: u32, admission: Option<(u32, Option<u64>)>) -> Option<Option<u64>> {
+    admission
+        .filter(|(reply_to, _)| *reply_to == correlation)
+        .map(|(_, epoch)| epoch)
+}
+
 static UP_SINCE: OnceLock<u32> = OnceLock::new();
 
 pub(super) fn init() {
@@ -449,15 +453,33 @@ pub(super) fn reject_during_replay(req: socket::Request) {
         }));
 }
 
+static STATE_FILE_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+pub(super) fn retire_state_file() {
+    STATE_FILE_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
 fn state_file(app: &mut super::App, fr: &super::run::Frame) {
     let json = snapshot(app, fr).to_string();
+    let epoch = STATE_FILE_EPOCH.load(Ordering::SeqCst);
     let path = plx_base::paths::in_runtime_dir(plx_base::paths::runtime_file::CONTROL_STATE);
     if plx_base::storage_worker::submit(move || {
+        if STATE_FILE_EPOCH.load(Ordering::SeqCst) != epoch {
+            return;
+        }
         if let Err(error) = plx_plex::plex::session::write_atomic(&path, json.as_bytes()) {
             log(&format!(
                 "api: state: could not write {}: {error:?}",
                 path.display()
             ));
+        } else if STATE_FILE_EPOCH.load(Ordering::SeqCst) != epoch {
+            // Erasure raced the rename. The shared worker serializes dump writers.
+            if let Err(error) = super::input::remove_or_prove_absent(&path) {
+                log(&format!(
+                    "api: state: could not finish erasing {}: {error}",
+                    path.display()
+                ));
+            }
         }
     })
     .is_err()
@@ -491,8 +513,9 @@ pub(crate) unsafe fn handle(
                 .request_seek(&mut app.player.session, ns),
             _ => false,
         },
-        "audio" => handle_track(app, fr, arg, true),
-        "sub" => handle_track(app, fr, arg, false),
+        "audio" | "sub" => arg
+            .parse()
+            .is_ok_and(|sid| handle_track(app, sid, kind == "audio").is_ok()),
         "quality" => handle_quality(app, arg).is_ok(),
         "profile" => handle_profile(app, fr, arg),
         _ => false,
@@ -602,28 +625,17 @@ pub(crate) unsafe fn execute_request(
                 answer(app, no_engine);
             }
         }
-        Verb::Audio { sid } => {
-            let ok = handle_track(app, fr, &sid.to_string(), true);
+        Verb::Audio { sid } | Verb::Sub { sid } => {
+            let audio = matches!(req.verb, Verb::Audio { .. });
+            let result = handle_track(app, sid, audio);
             answer(
                 app,
-                if ok {
-                    Reply::ok(Outcome::TrackCommitted {
-                        track: "audio",
+                match result {
+                    Ok(()) => Reply::ok(Outcome::TrackCommitted {
+                        track: if audio { "audio" } else { "sub" },
                         sid,
-                    })
-                } else {
-                    Reply::err(ApiError::NoTrack { sid })
-                },
-            );
-        }
-        Verb::Sub { sid } => {
-            let ok = handle_track(app, fr, &sid.to_string(), false);
-            answer(
-                app,
-                if ok {
-                    Reply::ok(Outcome::TrackCommitted { track: "sub", sid })
-                } else {
-                    Reply::err(ApiError::NoTrack { sid })
+                    }),
+                    Err(error) => Reply::err(error),
                 },
             );
         }
@@ -820,24 +832,16 @@ fn handle_stop(app: &mut super::App) -> bool {
 /// stream id and commit it through the media layer's own selection functions (the bare
 /// `_selection` commits the ladder uses: no viewer memo is remembered, which is right
 /// for an agent).
-unsafe fn handle_track(
-    app: &mut crate::app::App,
-    _fr: &mut crate::app::run::Frame,
-    arg: &str,
-    audio: bool,
-) -> bool {
-    let Ok(sid) = arg.parse::<i64>() else {
-        return false;
-    };
+fn handle_track(app: &mut super::App, sid: i64, audio: bool) -> Result<(), socket::ApiError> {
     let bridge = app.runtime.bridge(&mut app.bridge);
     let views = bridge.views();
     let Some(item) = views.metadata.playing() else {
-        return false;
+        return Err(socket::ApiError::NoTrack { sid });
     };
     use plx_appkit::track_menu::TrackCommit;
     let commit = if audio {
         let Some(i) = item.audio.iter().position(|stream| stream.id == sid) else {
-            return false;
+            return Err(socket::ApiError::NoTrack { sid });
         };
         let ordinal = plx_data::metadata::audio_ordinal(&item.audio, i);
         TrackCommit::Audio {
@@ -854,7 +858,7 @@ unsafe fn handle_track(
         }
     } else {
         let Some(i) = item.subs.iter().position(|stream| stream.id == sid) else {
-            return false;
+            return Err(socket::ApiError::NoTrack { sid });
         };
         let stream = &item.subs[i];
         TrackCommit::Subtitle {
@@ -872,6 +876,10 @@ unsafe fn handle_track(
         bridge.metadata_mut(),
         commit,
     )
+    .then_some(())
+    .ok_or_else(|| socket::ApiError::Internal {
+        reason: "the player refused the track change".into(),
+    })
 }
 
 fn handle_quality(app: &mut super::App, arg: &str) -> Result<(), socket::ApiError> {
@@ -1042,6 +1050,35 @@ fn snapshot(app: &mut super::App, fr: &super::run::Frame) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_later_nearby_feed_seek_cannot_complete_the_first() {
+        use plx_media::player::readout::ReadoutEvent;
+        let mut player = plx_media::route::PlaybackSession::default();
+        let uri = plx_playback_contract::Snapshot::default();
+        player.step_readout(ReadoutEvent::SeekRequested {
+            target_ns: 60_000_000_000,
+            display_ns: 60_000_000_000,
+        });
+        let first = SeekOperation::Feed(player.readout().seek_epoch());
+        assert_eq!(first.settled(&player, &uri), None);
+        player.step_readout(ReadoutEvent::SeekRequested {
+            target_ns: 61_000_000_000,
+            display_ns: 61_000_000_000,
+        });
+        assert_eq!(first.settled(&player, &uri), Some(false));
+        let second = SeekOperation::Feed(player.readout().seek_epoch());
+        assert_eq!(second.settled(&player, &uri), None);
+        player.step_readout(ReadoutEvent::SeekAbandoned);
+        assert_eq!(second.settled(&player, &uri), Some(false));
+    }
+
+    #[test]
+    fn profile_admission_uses_the_owners_epoch_and_matches_correlation() {
+        assert_eq!(profile_epoch(4, Some((3, Some(10)))), None);
+        assert_eq!(profile_epoch(4, Some((4, Some(12)))), Some(Some(12)));
+        assert_eq!(profile_epoch(4, Some((4, None))), Some(None));
+    }
 
     #[test]
     fn capture_and_supersession_reply_with_the_state_at_completion() {

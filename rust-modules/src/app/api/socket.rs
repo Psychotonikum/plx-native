@@ -12,7 +12,7 @@
 //! The synchronous verbs answer their commit on the spot — the same commit path the
 //! app's own actions use (`no_engine` with the state instead of a bare "no", the
 //! committed track's `sid`, a refused commit as a structured error). The asynchronous
-//! ones (play, seek, profile, shot) park in `api`'s AWAITING table and answer on the
+//! ones (play, seek, pause, resume, profile, shot) park in `api`'s AWAITING table and answer on the
 //! frame their outcome lands: `play_started` with the title, `seek_landed` with the
 //! position, `profile_seated` with the seated profile's title, `shot_captured` with the
 //! numbered file — or the structured failure that explains why.
@@ -90,9 +90,9 @@ pub enum Verb {
 }
 
 /// A structured outcome: what actually happened, in the action's own vocabulary — never
-/// an acknowledgement. The synchronous verbs (audio, sub, quality, pause, resume, stop)
+/// an acknowledgement. The synchronous verbs (audio, sub, quality, stop)
 /// answer their COMMIT: the media layer accepts or refuses on the spot. The asynchronous
-/// ones (play, seek, profile, shot) are parked in `api`'s AWAITING table when the
+/// ones (play, seek, pause, resume, profile, shot) are parked in `api`'s AWAITING table when the
 /// request's frame commits them, and answered on the frame their OUTCOME lands:
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -104,7 +104,7 @@ pub enum Outcome {
         title: String,
     },
     /// play: the play never started, with the reason from the layer that refused it —
-    /// the staging worker (no PMS selected, no such item, no playable part), the routing
+    /// metadata loading (no PMS selected, no such item, no playable part), the routing
     /// question, the engine's verdict, a supersession (a stop or a newer play), or the
     /// 120 s deadline.
     PlayFailed {
@@ -169,7 +169,7 @@ pub enum Outcome {
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
     /// The request line was not a request (bad JSON, an unknown `kind`, a missing or
-    /// mistyped argument). Carries no id — there was none to echo.
+    /// mistyped argument). Echoes a valid envelope ID when present.
     Malformed { reason: String },
     /// The verb needs a seated engine; the session is in the named state instead.
     NoEngine { state: &'static str },
@@ -395,7 +395,7 @@ fn serve(mut conn: UnixStream, mut enqueue: impl FnMut(Request) -> bool) {
 /// One line of the wire: a request object (`{"id": 42, "req": ...}`) or
 /// nothing. Returns the client's id and its verb when the line is a request
 /// object; a malformed line's reply is the protocol's only on-the-spot answer,
-/// and it names no id — there was none to echo.
+/// and echoes its ID when the envelope contains one.
 fn parse(line: &str) -> Result<(u64, Verb), Option<u64>> {
     let mut request: serde_json::Value = serde_json::from_str(line).map_err(|_| None)?;
     let id = request["id"].as_u64().ok_or(None)?;

@@ -1756,6 +1756,8 @@ pub(crate) fn delete_all_local_data(meta: &mut plx_data::stores::metadata::Metad
     mut failures: Vec<String>) -> Vec<String> {
     // Retire the writer before the privacy sweep unlinks its log files.
     plx_os::playback_trace::retire();
+    #[cfg(feature = "devtriggers")]
+    super::api::retire_state_file();
     failures.extend(sweep_local_files(
         plx_base::paths::obsolete_last_place_candidates()
             .into_iter()
